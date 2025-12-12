@@ -1,0 +1,588 @@
+//+------------------------------------------------------------------+
+//|                    Team Trading EA Pro v5.23 HYBRID - PART 1     |
+//|                    Copy baris 1-600 ini ke file baru             |
+//+------------------------------------------------------------------+
+#property copyright "Team Trading EA Pro - v5.23 HYBRID"
+#property version   "5.23"
+#property strict
+
+input bool EnablePanel=true;
+input bool EnableDetailedLog=false;
+input int PanelUpdateInterval=1;
+input int PanelCorner=0;
+input int PanelX=20;
+input int PanelY=30;
+input double InitialLot=0.01;input double LotIncrement=0.01;input int StopLossPips=100;input double ReverseLot=0.40;
+input double ProfitPerLot=100.0;input int MagicNumberRed=1001;input int MagicNumberBlue=2001;
+input bool EnableAghanimScepter=false;input double AghanimTriggerLot=0.30;input bool EnableTradingHours=false;
+input int StartHour=0;input int StartMinute=0;input int PauseHour=23;input int PauseMinute=59;
+input int MaxRetries=5;input int RetryDelay=150;input int MaxSlippage=3;input bool EnableAutoTuning=false;
+input int LatencyThreshold=15;input bool EnableDebugMode=false;input int StatusUpdateInterval=300;
+input bool EnableSpreadFilter=true;input double MaxSpreadPips=3.0;
+
+string PanelPrefix="TTEA_";color PanelBG=C'25,25,35';color PanelText=clrWhite;color PanelGreen=C'0,200,100';
+color PanelRed=C'255,80,80';color PanelYellow=C'255,200,0';color PanelBlue=C'100,150,255';
+color PanelPurple=C'200,100,255';uint LastPanelUpdate=0;
+
+double InitialBalance,TargetEquity,MaxTotalLotReached,LockedTargetEquity,RedLastLot,BlueLastLot;
+double TotalLossFromInitial,BalanceAtAghanimActivation,LastLockedLoss,LastMeasuredLatency;
+bool IsInitialized,ShowStatusUpdate,AghanimActive,AghanimTriggeredRed,AghanimTriggeredBlue;
+bool IsTrading=true,IsPaused,WaitingForOrdersToClose,PrintOrderDetails=true;
+string RedTeamDirection="SELL",BlueTeamDirection="BUY";
+uint LastTickCount,LastStatusPrintTime,LastCleanupPrintTime,LastCleanupTime,LastTuningTime;
+int TickCounter,AdjustedTickets[],AdjustedTicketCount,CurrentMaxRetries=5,CurrentRetryDelay=150;
+int SuccessfulOrders,FailedOrders,TotalOrderAttempts,retryCount;uint LastBalanceCheckTime=0;
+
+struct RetryInfo{string action;int ticket;double targetSL,lots,price,sl,closePrice;uint lastAttemptTime;
+int attemptCount,magicNumber,orderType;bool active;string direction;};RetryInfo pendingRetries[100];
+
+// Deklarasi fungsi panel (implementasi di PART 3)
+void CreatePanel();void UpdatePanel();void DeletePanel();
+void CreateLabel(string n,int x,int y,color c,string t,int fs,bool b);
+void CreateObject(string n,int x,int y,int w,int h,color bg);
+void CreateSeparator(string n,int x,int y,int w);
+void UpdateLabel(string n,string t,color c);
+
+void SmartPrint(string m,bool f=false){if(EnableDetailedLog||f||EnableDebugMode)Print(m);}
+
+int OnInit(){
+if(!ValidateInputs())return INIT_PARAMETERS_INCORRECT;
+InitialBalance=AccountBalance();IsInitialized=false;AghanimActive=false;TotalLossFromInitial=0;
+BalanceAtAghanimActivation=0;LastLockedLoss=0;AghanimTriggeredRed=false;AghanimTriggeredBlue=false;
+IsTrading=true;IsPaused=false;WaitingForOrdersToClose=false;LastTickCount=0;TickCounter=0;
+ArrayResize(AdjustedTickets,0);AdjustedTicketCount=0;LastCleanupTime=0;retryCount=0;
+CurrentMaxRetries=MaxRetries;CurrentRetryDelay=RetryDelay;LastMeasuredLatency=0;LastTuningTime=0;
+SuccessfulOrders=0;FailedOrders=0;TotalOrderAttempts=0;MaxTotalLotReached=0;LockedTargetEquity=0;
+LastStatusPrintTime=0;LastCleanupPrintTime=0;PrintOrderDetails=true;LastBalanceCheckTime=GetTickCount();LastPanelUpdate=0;
+Print("========================================");Print("EA v5.23 HYBRID PANEL");
+Print("Balance: $",DoubleToString(InitialBalance,2));Print("Panel: ",EnablePanel?"ON":"OFF");
+Print("DetailLog: ",EnableDetailedLog?"ON":"OFF");Print("Aghanim: ",EnableAghanimScepter?"ON":"OFF");
+Print("========================================");if(EnablePanel){CreatePanel();Print("✓ Panel OK");}
+return INIT_SUCCEEDED;}
+
+bool ValidateInputs(){bool v=true;
+if(MagicNumberRed==MagicNumberBlue){Print("ERROR: MagicNumbers same!");v=false;}
+if(InitialLot<=0){Print("ERROR: InitialLot<=0");v=false;}
+if(StopLossPips<=0){Print("ERROR: StopLossPips<=0");v=false;}
+if(ProfitPerLot<=0){Print("ERROR: ProfitPerLot<=0");v=false;}
+double ml=MarketInfo(Symbol(),MODE_MINLOT);
+if(InitialLot<ml){Print("ERROR: InitialLot<MinLot");v=false;}return v;}
+
+void OnDeinit(const int r){if(EnablePanel)DeletePanel();Print("Stopped. Reason:",r);
+if(TotalOrderAttempts>0){double rt=(SuccessfulOrders*100.0)/TotalOrderAttempts;
+Print("Success: ",DoubleToString(rt,1),"%");}}
+
+void OnTick(){TickCounter++;LastTickCount=GetTickCount();RefreshRates();
+CheckBalanceChanges();ProcessPendingRetries();CheckTradingHours();
+if(WaitingForOrdersToClose){int t=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(t==0){IsPaused=true;WaitingForOrdersToClose=false;IsTrading=false;
+SmartPrint("PAUSED",true);if(EnablePanel)UpdatePanel();return;}
+CheckAghanimActivation();CalculateTargetEquity();
+if(TargetEquity>0&&AccountEquity()>=TargetEquity){SmartPrint("TARGET!",true);CloseAllOrders();
+Sleep(500);RefreshRates();int r=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(r==0){ResetEA();IsPaused=true;WaitingForOrdersToClose=false;IsTrading=false;}
+if(EnablePanel)UpdatePanel();return;}if(EnablePanel)UpdatePanel();return;}
+if(IsPaused||!IsTrading){if(EnablePanel)UpdatePanel();return;}
+if(!IsInitialized){InitializeOrders();IsInitialized=true;if(EnablePanel)UpdatePanel();return;}
+AutoAdjustNewOrdersSL();if(EnableAutoTuning)AutoTuneExecutionSettings();
+CheckAghanimActivation();CalculateTargetEquity();
+if(EnableDetailedLog&&(EnableDebugMode||ShowStatusUpdate||ShouldPrintStatus())){PrintStatus();ShowStatusUpdate=false;}
+int t=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(TargetEquity>0&&AccountEquity()>=TargetEquity&&t>0&&MaxTotalLotReached>0){
+PrintTargetReached();CloseAllOrders();Sleep(500);RefreshRates();
+int r=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(r==0){ResetEA();}else{SmartPrint("Orders open",true);WaitingForOrdersToClose=true;}
+if(EnablePanel)UpdatePanel();return;}
+MonitorTeam(MagicNumberRed,RedTeamDirection,RedLastLot,"RED");
+MonitorTeam(MagicNumberBlue,BlueTeamDirection,BlueLastLot,"BLUE");
+if(EnablePanel){uint c=GetTickCount();
+if(c-LastPanelUpdate>=(uint)(PanelUpdateInterval*1000)){UpdatePanel();LastPanelUpdate=c;}}}
+
+void CheckBalanceChanges(){uint c=GetTickCount();if(c-LastBalanceCheckTime<30000)return;
+LastBalanceCheckTime=c;double cb=AccountBalance();int t=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(t==0){double d=cb-InitialBalance;if(MathAbs(d)>1.0){
+SmartPrint("Balance change: $"+DoubleToString(d,2),true);InitialBalance=cb;
+if(AghanimActive){BalanceAtAghanimActivation=cb;LastLockedLoss=0;SmartPrint("Aghanim adj",true);}}}}
+
+void ProcessPendingRetries(){uint c=GetTickCount();
+for(int i=0;i<retryCount;i++){if(!pendingRetries[i].active)continue;uint d=0;
+if(c>=pendingRetries[i].lastAttemptTime)d=c-pendingRetries[i].lastAttemptTime;
+else d=0xFFFFFFFF-pendingRetries[i].lastAttemptTime+c;if(d<(uint)CurrentRetryDelay)continue;
+bool ok=false;
+if(pendingRetries[i].action=="MODIFY_SL"){
+if(OrderSelect(pendingRetries[i].ticket,SELECT_BY_TICKET)&&OrderSymbol()==Symbol()&&OrderCloseTime()==0)
+ok=OrderModify(pendingRetries[i].ticket,OrderOpenPrice(),pendingRetries[i].targetSL,0,0,clrNONE);else ok=true;}
+else if(pendingRetries[i].action=="OPEN_ORDER"){if(EnableSpreadFilter){RefreshRates();double p=GetAdjustedPoint();
+double s=(Ask-Bid)/p;if(s>MaxSpreadPips){SmartPrint("Retry spread high");
+pendingRetries[i].lastAttemptTime=c;continue;}}RefreshRates();color cl=(pendingRetries[i].orderType==OP_BUY)?clrBlue:clrRed;
+int tk=OrderSend(Symbol(),pendingRetries[i].orderType,pendingRetries[i].lots,pendingRetries[i].price,
+MaxSlippage,pendingRetries[i].sl,0,"Team",pendingRetries[i].magicNumber,0,cl);
+if(tk>0){ok=true;SuccessfulOrders++;SmartPrint("✓ Retry #"+IntegerToString(tk));}}
+else if(pendingRetries[i].action=="CLOSE_ORDER"){if(OrderSelect(pendingRetries[i].ticket,SELECT_BY_TICKET)&&OrderSymbol()==Symbol()){
+if(OrderCloseTime()==0){RefreshRates();int ot=OrderType();double lt=OrderLots();double cp=(ot==OP_BUY)?Bid:Ask;
+ok=OrderClose(pendingRetries[i].ticket,lt,cp,MaxSlippage,clrNONE);if(ok)SmartPrint("✓ Retry close");}
+else ok=true;}else ok=true;}pendingRetries[i].attemptCount++;
+if(ok||pendingRetries[i].attemptCount>=CurrentMaxRetries){pendingRetries[i].active=false;
+if(!ok){SmartPrint("✗ Retry fail",true);if(pendingRetries[i].action=="OPEN_ORDER")FailedOrders++;}}
+else{pendingRetries[i].lastAttemptTime=c;}}static uint lc=0;uint cd=0;
+if(c>=lc)cd=c-lc;else cd=0xFFFFFFFF-lc+c;if(cd>60000){CleanupRetryQueue();lc=c;}}
+
+void CleanupRetryQueue(){int a=0;for(int i=0;i<retryCount;i++)if(pendingRetries[i].active)a++;
+if(a<retryCount/2&&retryCount>20){RetryInfo t[100];int n=0;
+for(int i=0;i<retryCount&&n<100;i++)if(pendingRetries[i].active){t[n]=pendingRetries[i];n++;}
+for(int i=0;i<n;i++)pendingRetries[i]=t[i];
+for(int i=n;i<retryCount;i++){pendingRetries[i].action="";pendingRetries[i].active=false;}retryCount=n;}}
+
+void AddPendingRetry(string a,int tk,double ts=0){if(retryCount>=100)return;int f=-1;
+for(int i=0;i<retryCount;i++)if(!pendingRetries[i].active){f=i;break;}
+if(f>=0){pendingRetries[f].action=a;pendingRetries[f].ticket=tk;pendingRetries[f].targetSL=ts;
+pendingRetries[f].lastAttemptTime=GetTickCount();pendingRetries[f].attemptCount=0;pendingRetries[f].active=true;return;}
+pendingRetries[retryCount].action=a;pendingRetries[retryCount].ticket=tk;pendingRetries[retryCount].targetSL=ts;
+pendingRetries[retryCount].lastAttemptTime=GetTickCount();pendingRetries[retryCount].attemptCount=0;
+pendingRetries[retryCount].active=true;retryCount++;}
+
+void AddPendingOrderRetry(string d,double l,int m,double p,double s,int o){if(retryCount>=100)return;int f=-1;
+for(int i=0;i<retryCount;i++)if(!pendingRetries[i].active){f=i;break;}
+if(f>=0){pendingRetries[f].action="OPEN_ORDER";pendingRetries[f].direction=d;pendingRetries[f].lots=l;
+pendingRetries[f].magicNumber=m;pendingRetries[f].price=p;pendingRetries[f].sl=s;pendingRetries[f].orderType=o;
+pendingRetries[f].lastAttemptTime=GetTickCount();pendingRetries[f].attemptCount=0;pendingRetries[f].active=true;return;}
+pendingRetries[retryCount].action="OPEN_ORDER";pendingRetries[retryCount].direction=d;pendingRetries[retryCount].lots=l;
+pendingRetries[retryCount].magicNumber=m;pendingRetries[retryCount].price=p;pendingRetries[retryCount].sl=s;
+pendingRetries[retryCount].orderType=o;pendingRetries[retryCount].lastAttemptTime=GetTickCount();
+pendingRetries[retryCount].attemptCount=0;pendingRetries[retryCount].active=true;retryCount++;}
+
+void AddPendingCloseRetry(int tk){if(retryCount>=100)return;int f=-1;
+for(int i=0;i<retryCount;i++)if(!pendingRetries[i].active){f=i;break;}
+if(f>=0){pendingRetries[f].action="CLOSE_ORDER";pendingRetries[f].ticket=tk;
+pendingRetries[f].lastAttemptTime=GetTickCount();pendingRetries[f].attemptCount=0;pendingRetries[f].active=true;return;}
+pendingRetries[retryCount].action="CLOSE_ORDER";pendingRetries[retryCount].ticket=tk;
+pendingRetries[retryCount].lastAttemptTime=GetTickCount();pendingRetries[retryCount].attemptCount=0;
+pendingRetries[retryCount].active=true;retryCount++;}
+
+double GetAdjustedPoint(){double p=Point;if(Digits==5)p=Point*10;
+else if(Digits==3&&StringFind(Symbol(),"JPY")<0)p=Point*10;return p;}
+
+double DetectBrokerHealth(){if(LastMeasuredLatency>0&&LastMeasuredLatency<5000)return LastMeasuredLatency;
+uint s=GetTickCount();TimeCurrent();RefreshRates();uint e=GetTickCount();double l=(double)(e-s);
+if(l<5)l=50;if(l>5000)l=5000;return l;}
+
+void AutoTuneExecutionSettings(){uint c=GetTickCount();if(LastTuningTime>0){uint d=0;
+if(c>=LastTuningTime)d=c-LastTuningTime;else d=0xFFFFFFFF-LastTuningTime+c;if(d<60000)return;}
+double l=DetectBrokerHealth();LastMeasuredLatency=l;LastTuningTime=c;ApplyAdaptiveSettings(l);}
+
+void ApplyAdaptiveSettings(double l){if(l<100){CurrentMaxRetries=3;CurrentRetryDelay=100;}
+else if(l<200){CurrentMaxRetries=5;CurrentRetryDelay=150;}
+else if(l<300){CurrentMaxRetries=7;CurrentRetryDelay=200;}
+else{CurrentMaxRetries=10;CurrentRetryDelay=250;}}
+
+bool IsTicketAdjusted(int tk){for(int i=0;i<AdjustedTicketCount;i++)if(AdjustedTickets[i]==tk)return true;return false;}
+
+void AddAdjustedTicket(int tk){if(IsTicketAdjusted(tk))return;
+if(AdjustedTicketCount>=ArraySize(AdjustedTickets))ArrayResize(AdjustedTickets,AdjustedTicketCount+50);
+AdjustedTickets[AdjustedTicketCount]=tk;AdjustedTicketCount++;}
+
+void CleanupAdjustedTickets(){uint c=GetTickCount();uint d=0;
+if(c>=LastCleanupTime)d=c-LastCleanupTime;else d=0xFFFFFFFF-LastCleanupTime+c;if(d<300000)return;
+LastCleanupTime=c;int tmp[];int tc=0;ArrayResize(tmp,AdjustedTicketCount);
+for(int i=0;i<AdjustedTicketCount;i++)if(OrderSelect(AdjustedTickets[i],SELECT_BY_TICKET)&&OrderSymbol()==Symbol())
+if(OrderCloseTime()==0){tmp[tc]=AdjustedTickets[i];tc++;}
+if(tc<AdjustedTicketCount){if(tc>0){ArrayResize(AdjustedTickets,tc);
+for(int i=0;i<tc;i++)AdjustedTickets[i]=tmp[i];}else ArrayResize(AdjustedTickets,0);AdjustedTicketCount=tc;}}
+
+void AutoAdjustNewOrdersSL(){double pt=GetAdjustedPoint();double sd=StopLossPips*pt;CleanupAdjustedTickets();
+int tot=OrdersTotal();int tix[];int typ[];double opr[];double osl[];ArrayResize(tix,tot);ArrayResize(typ,tot);
+ArrayResize(opr,tot);ArrayResize(osl,tot);int vc=0;
+for(int i=tot-1;i>=0;i--){if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))continue;if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=MagicNumberRed&&OrderMagicNumber()!=MagicNumberBlue)continue;if(OrderCloseTime()!=0)continue;
+tix[vc]=OrderTicket();typ[vc]=OrderType();opr[vc]=OrderOpenPrice();osl[vc]=OrderStopLoss();vc++;}
+for(int ix=0;ix<vc;ix++){int tk=tix[ix];if(IsTicketAdjusted(tk))continue;
+if(!OrderSelect(tk,SELECT_BY_TICKET)||OrderSymbol()!=Symbol()){AddAdjustedTicket(tk);continue;}
+if(OrderCloseTime()!=0){AddAdjustedTicket(tk);continue;}int ot=typ[ix];double op=opr[ix];double cs=osl[ix];double ts;
+if(ot==OP_BUY){if(op<=sd){AddAdjustedTicket(tk);continue;}ts=NormalizeDouble(op-sd,Digits);
+double ms=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;if((op-ts)<ms)ts=NormalizeDouble(op-ms,Digits);}
+else if(ot==OP_SELL){ts=NormalizeDouble(op+sd,Digits);double ms=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+if((ts-op)<ms)ts=NormalizeDouble(op+ms,Digits);}else{AddAdjustedTicket(tk);continue;}
+if(ts<=0){AddAdjustedTicket(tk);continue;}double cp=0;if(cs>0){if(ot==OP_BUY)cp=(op-cs)/pt;else cp=(cs-op)/pt;}
+if(cs==0||MathAbs(cp-StopLossPips)>2){AdjustOrderSL(tk,ts);}AddAdjustedTicket(tk);}}
+
+bool AdjustOrderSL(int tk,double ts){if(!OrderSelect(tk,SELECT_BY_TICKET)||OrderSymbol()!=Symbol())return false;
+if(OrderCloseTime()!=0)return true;bool r=OrderModify(tk,OrderOpenPrice(),ts,0,0,clrNONE);
+if(!r){int e=GetLastError();if(e==1)return true;if(e==4756)e=146;
+if(e==135||e==136||e==138||e==146){AddPendingRetry("MODIFY_SL",tk,ts);return false;}return false;}return true;}
+
+void CheckTradingHours(){if(!EnableTradingHours){IsTrading=true;IsPaused=false;return;}
+datetime ct=TimeCurrent();int ch=TimeHour(ct);int cm=TimeMinute(ct);int cmin=ch*60+cm;
+int smin=StartHour*60+StartMinute;int pmin=PauseHour*60+PauseMinute;bool st=false;
+if(smin<pmin)st=(cmin>=smin&&cmin<pmin);else if(smin>pmin)st=(cmin>=smin||cmin<pmin);else st=true;
+if(!WaitingForOrdersToClose&&!IsPaused&&IsTrading&&!st){SmartPrint("PAUSE",true);CalculateTargetEquity();
+if(TargetEquity>0&&AccountEquity()>=TargetEquity){CloseAllOrders();Sleep(500);RefreshRates();
+int r=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(r==0){ResetEA();IsPaused=true;IsTrading=false;WaitingForOrdersToClose=false;}
+else{WaitingForOrdersToClose=true;IsTrading=false;}}else{int t=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(t>0){WaitingForOrdersToClose=true;IsTrading=false;}else{IsPaused=true;IsTrading=false;}}}
+if(IsPaused&&st){IsPaused=false;IsTrading=true;WaitingForOrdersToClose=false;SmartPrint("RESUME",true);}}
+
+// ===== PART 1 SELESAI =====
+// Lanjut ke PART 2 untuk fungsi trading
+// ===== PART 2: TRADING FUNCTIONS =====
+// Copy code ini dan TAMBAHKAN setelah PART 1
+
+void InitializeOrders(){
+bool r=OpenOrder(RedTeamDirection,InitialLot,MagicNumberRed);
+bool b=OpenOrder(BlueTeamDirection,InitialLot,MagicNumberBlue);
+if(r)RedLastLot=InitialLot;if(b)BlueLastLot=InitialLot;
+Sleep(100);RefreshRates();double tl=GetTotalLot();
+if(tl>0){MaxTotalLotReached=tl;double tp=tl*ProfitPerLot;
+LockedTargetEquity=InitialBalance+tp;TargetEquity=LockedTargetEquity;
+SmartPrint("========================================",true);
+SmartPrint("Orders opened",true);
+SmartPrint("Red: "+RedTeamDirection+" "+DoubleToString(InitialLot,2),true);
+SmartPrint("Blue: "+BlueTeamDirection+" "+DoubleToString(InitialLot,2),true);
+SmartPrint("Total: "+DoubleToString(tl,2),true);
+SmartPrint("Target: $"+DoubleToString(TargetEquity,2),true);
+SmartPrint("========================================",true);}
+else{SmartPrint("No orders opened!",true);}ShowStatusUpdate=true;}
+
+void CheckAghanimActivation(){
+if(!EnableAghanimScepter||AghanimActive)return;bool act=false;
+if(!AghanimTriggeredRed&&RedLastLot>=AghanimTriggerLot){
+AghanimTriggeredRed=true;act=true;SmartPrint("RED Aghanim!",true);}
+if(!AghanimTriggeredBlue&&BlueLastLot>=AghanimTriggerLot){
+AghanimTriggeredBlue=true;act=true;SmartPrint("BLUE Aghanim!",true);}
+if(act){AghanimActive=true;BalanceAtAghanimActivation=AccountBalance();
+double il=InitialBalance-BalanceAtAghanimActivation;if(il<0)il=0;
+LastLockedLoss=il;TotalLossFromInitial=il;
+SmartPrint("========================================",true);
+SmartPrint("*** AGHANIM ACTIVATED! ***",true);
+SmartPrint("Initial: $"+DoubleToString(InitialBalance,2),true);
+SmartPrint("Current: $"+DoubleToString(BalanceAtAghanimActivation,2),true);
+SmartPrint("Loss: $"+DoubleToString(il,2),true);
+SmartPrint("Target: $"+DoubleToString(InitialBalance+il,2),true);
+SmartPrint("Need: $"+DoubleToString(il*2,2),true);
+SmartPrint("========================================",true);ShowStatusUpdate=true;}}
+
+void CalculateTargetEquity(){
+if(AghanimActive){
+double cb=AccountBalance();double cl=InitialBalance-cb;if(cl<0)cl=0;
+if(cl>LastLockedLoss){LastLockedLoss=cl;TotalLossFromInitial=cl;
+SmartPrint(">>> Loss: $"+DoubleToString(cl,2),true);
+SmartPrint(">>> Target: $"+DoubleToString(InitialBalance+cl,2),true);}
+else if(cb<(InitialBalance-LastLockedLoss)){
+double nl=InitialBalance-cb;LastLockedLoss=nl;TotalLossFromInitial=nl;
+SmartPrint(">>> New loss: $"+DoubleToString(nl,2),true);
+SmartPrint(">>> Target: $"+DoubleToString(InitialBalance+nl,2),true);}
+TargetEquity=InitialBalance+LastLockedLoss;}
+else{double tl=GetTotalLot();
+if(InitialBalance<=0){SmartPrint("ERROR: InitialBalance",true);
+InitialBalance=AccountBalance();SmartPrint("Corrected: $"+DoubleToString(InitialBalance,2),true);}
+if(MaxTotalLotReached<InitialLot){SmartPrint("ERROR: MaxLot<InitialLot",true);
+MaxTotalLotReached=InitialLot;SmartPrint("Corrected: "+DoubleToString(MaxTotalLotReached,2),true);}
+if(tl<MaxTotalLotReached*0.5&&MaxTotalLotReached>InitialLot*2){
+SmartPrint(">>> MaxLot decreased");MaxTotalLotReached=MathMax(tl,InitialLot*2);}
+if(tl>MaxTotalLotReached){MaxTotalLotReached=tl;
+SmartPrint(">>> MaxLot: "+DoubleToString(MaxTotalLotReached,2));}
+double tp=MaxTotalLotReached*ProfitPerLot;double et=InitialBalance+tp;
+if(et<=InitialBalance){SmartPrint("ERROR: Target<=Balance",true);et=InitialBalance+tp;
+SmartPrint("Corrected: $"+DoubleToString(et,2),true);}
+double maxrt=InitialBalance+(MaxTotalLotReached*ProfitPerLot*10);
+if(et>maxrt){SmartPrint("ERROR: Target anomaly",true);et=InitialBalance+tp;
+SmartPrint("Corrected: $"+DoubleToString(et,2),true);}
+double mint=InitialBalance+(InitialLot*ProfitPerLot);if(et<mint){et=mint;}
+if(et>LockedTargetEquity){LockedTargetEquity=et;
+SmartPrint(">>> Target: $"+DoubleToString(LockedTargetEquity,2));
+SmartPrint("    Profit: $"+DoubleToString(tp,2));}
+if(LockedTargetEquity<=InitialBalance){SmartPrint("CRITICAL: Target<=Balance",true);
+double rc=InitialBalance+(MaxTotalLotReached*ProfitPerLot);
+if(rc<=InitialBalance)rc=InitialBalance+(InitialLot*ProfitPerLot);
+LockedTargetEquity=rc;SmartPrint("Corrected: $"+DoubleToString(LockedTargetEquity,2),true);}
+TargetEquity=LockedTargetEquity;}}
+
+bool ShouldPrintStatus(){uint c=GetTickCount();if(LastStatusPrintTime==0){LastStatusPrintTime=c;return false;}
+uint e=0;if(c>=LastStatusPrintTime)e=c-LastStatusPrintTime;else e=0xFFFFFFFF-LastStatusPrintTime+c;
+if(e/1000>=(uint)StatusUpdateInterval){LastStatusPrintTime=c;return true;}return false;}
+
+void PrintTargetReached(){
+SmartPrint("========================================",true);
+SmartPrint("*** TARGET REACHED! ***",true);
+SmartPrint("Initial: $"+DoubleToString(InitialBalance,2),true);
+SmartPrint("Equity: $"+DoubleToString(AccountEquity(),2),true);
+SmartPrint("Target: $"+DoubleToString(TargetEquity,2),true);
+SmartPrint("Profit: +$"+DoubleToString(AccountEquity()-InitialBalance,2),true);
+if(AghanimActive){SmartPrint("--- AGHANIM RESULT ---",true);
+SmartPrint("Max Loss: $"+DoubleToString(LastLockedLoss,2),true);
+SmartPrint("Lowest: $"+DoubleToString(InitialBalance-LastLockedLoss,2),true);
+SmartPrint("Recovery: $"+DoubleToString(AccountEquity()-(InitialBalance-LastLockedLoss),2),true);
+if(InitialBalance>0){double roi=((AccountEquity()-InitialBalance)*100.0)/InitialBalance;
+SmartPrint("ROI: "+DoubleToString(roi,2)+"%",true);}}
+SmartPrint("========================================",true);}
+
+void PrintStatus(){
+SmartPrint("========================================",true);
+SmartPrint("--- STATUS ---",true);
+if(EnableTradingHours)SmartPrint("Status: "+(IsTrading?"ACTIVE":"PAUSED"),true);
+SmartPrint("Initial: $"+DoubleToString(InitialBalance,2),true);
+SmartPrint("Balance: $"+DoubleToString(AccountBalance(),2),true);
+SmartPrint("Equity: $"+DoubleToString(AccountEquity(),2),true);
+if(AghanimActive){SmartPrint("--- AGHANIM ACTIVE ---",true);
+SmartPrint("At activation: $"+DoubleToString(BalanceAtAghanimActivation,2),true);
+SmartPrint("Locked loss: $"+DoubleToString(LastLockedLoss,2),true);
+double cl=MathMax(0,InitialBalance-AccountBalance());
+SmartPrint("Current loss: $"+DoubleToString(cl,2),true);
+if(cl<LastLockedLoss){double rec=LastLockedLoss-cl;
+if(LastLockedLoss>0.01){
+SmartPrint("Recovered: $"+DoubleToString(rec,2)+" ("+DoubleToString((rec*100.0)/LastLockedLoss,1)+"%)",true);}
+else SmartPrint("Recovered: $"+DoubleToString(rec,2),true);}
+SmartPrint("Target: $"+DoubleToString(TargetEquity,2),true);
+double need=TargetEquity-AccountEquity();SmartPrint("Need: $"+DoubleToString(need,2),true);
+double prog=0;if(LastLockedLoss>0.01){double tn=LastLockedLoss*2.0;
+if(tn>0.01){double ach=tn-need;prog=(ach*100.0)/tn;}}
+SmartPrint("Progress: "+DoubleToString(prog,1)+"%",true);}
+else{double tl=GetTotalLot();SmartPrint("TotalLot: "+DoubleToString(tl,2),true);
+SmartPrint("MaxLot: "+DoubleToString(MaxTotalLotReached,2),true);
+SmartPrint("Profit: $"+DoubleToString(MaxTotalLotReached*ProfitPerLot,2),true);
+SmartPrint("Target: $"+DoubleToString(TargetEquity,2)+" (Locked)",true);
+if(EnableAghanimScepter)SmartPrint("Aghanim: Red:"+DoubleToString(RedLastLot,2)+" Blue:"+DoubleToString(BlueLastLot,2),true);}
+SmartPrint("--- Orders ---",true);PrintActiveOrders();SmartPrint("========================================",true);}
+
+void MonitorTeam(int mg,string &dir,double &last,string name){
+int tot=CountOrders(mg);if(tot==0){
+if(!IsTrading||IsPaused){SmartPrint(name+" skip: paused");return;}
+if(EnableSpreadFilter){RefreshRates();double pt=GetAdjustedPoint();double sp=(Ask-Bid)/pt;
+if(sp>MaxSpreadPips){SmartPrint(name+" skip: spread");return;}}
+double nl=CalculateNextLot(last);
+if(last>=ReverseLot){dir=(dir=="BUY")?"SELL":"BUY";
+SmartPrint(name+" REVERSE! "+DoubleToString(last,2)+" → "+dir+" "+DoubleToString(nl,2),true);}
+else SmartPrint(name+" "+dir+" "+DoubleToString(nl,2));
+RefreshRates();int rchk=CountOrders(mg);
+if(rchk==0){if(OpenOrder(dir,nl,mg)){last=nl;ShowStatusUpdate=true;}}
+else SmartPrint(name+" order exists");}}
+
+double CalculateNextLot(double curr){double next=curr+LotIncrement;
+double minl=MarketInfo(Symbol(),MODE_MINLOT);double maxl=MarketInfo(Symbol(),MODE_MAXLOT);
+double step=MarketInfo(Symbol(),MODE_LOTSTEP);if(next<minl)next=minl;
+next=MathMax(minl,MathMin(maxl,next));next=NormalizeDouble(next/step,0)*step;
+if(next<minl)next=minl;return next;}
+
+bool OpenOrder(string dir,double lot,int mg){
+double pt=GetAdjustedPoint();RefreshRates();
+if(EnableSpreadFilter){double sp=(Ask-Bid)/pt;
+if(sp>MaxSpreadPips){SmartPrint("Blocked: Spread "+DoubleToString(sp,1),true);return false;}}
+double sld=StopLossPips*pt;double pr,sl;int ot;color cl;
+if(dir=="BUY"){pr=Ask;if(pr<=sld){SmartPrint("Blocked: Price low",true);return false;}
+sl=NormalizeDouble(pr-sld,Digits);double msl=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+if((pr-sl)<msl)sl=NormalizeDouble(pr-msl,Digits);ot=OP_BUY;cl=clrBlue;}
+else{pr=Bid;sl=NormalizeDouble(pr+sld,Digits);double msl=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+if((sl-pr)<msl)sl=NormalizeDouble(pr+msl,Digits);ot=OP_SELL;cl=clrRed;}
+if(sl<=0){SmartPrint("Blocked: Invalid SL",true);return false;}
+double minl=MarketInfo(Symbol(),MODE_MINLOT);double maxl=MarketInfo(Symbol(),MODE_MAXLOT);
+if(lot<minl||lot>maxl){SmartPrint("Blocked: Lot "+DoubleToString(lot,2),true);return false;}
+double reqm=MarketInfo(Symbol(),MODE_MARGINREQUIRED)*lot;double freem=AccountFreeMargin();
+if(freem<reqm){SmartPrint("Blocked: Margin. Need:$"+DoubleToString(reqm,2)+" Free:$"+DoubleToString(freem,2),true);
+return false;}
+int tk=-1;TotalOrderAttempts++;uint st=GetTickCount();
+tk=OrderSend(Symbol(),ot,lot,pr,MaxSlippage,sl,0,"Team",mg,0,cl);
+uint et=GetTickCount();double ext=(double)(et-st);
+if(tk>0&&ext>0&&ext<10000){if(LastMeasuredLatency>0)
+LastMeasuredLatency=MathMin(5000,(LastMeasuredLatency*0.7)+(ext*0.3));
+else LastMeasuredLatency=MathMin(5000,ext);}
+if(tk>0){SuccessfulOrders++;
+if(OrderSelect(tk,SELECT_BY_TICKET)&&OrderSymbol()==Symbol()){double asp=0;
+if(dir=="BUY")asp=(OrderOpenPrice()-OrderStopLoss())/pt;
+else asp=(OrderStopLoss()-OrderOpenPrice())/pt;
+SmartPrint("✓ "+dir+" #"+IntegerToString(tk)+" Lot:"+DoubleToString(lot,2)+" SL:"+DoubleToString(asp,1)+"p",true);
+if(MathAbs(asp-StopLossPips)>5)
+SmartPrint("WARNING: SL deviation! Target:"+IntegerToString(StopLossPips)+" Actual:"+DoubleToString(asp,1),true);}
+return true;}
+else{int err=GetLastError();
+SmartPrint("✗ FAILED: "+dir+" Lot:"+DoubleToString(lot,2)+" Err:"+IntegerToString(err),true);
+SmartPrint("   Ask:"+DoubleToString(Ask,Digits)+" Bid:"+DoubleToString(Bid,Digits)+" Sp:"+DoubleToString((Ask-Bid)/pt,1)+"p",true);
+if(err==129||err==130||err==131||err==134){FailedOrders++;
+SmartPrint("CRITICAL: "+ErrorDescription(err),true);return false;}
+if(err==4756)err=146;
+if(err==135||err==136||err==138||err==146||err==4||err==8){
+SmartPrint("Retriable - Queue",true);AddPendingOrderRetry(dir,lot,mg,pr,sl,ot);return false;}
+FailedOrders++;return false;}}
+
+double GetTotalLot(){double tot=0;
+for(int i=OrdersTotal()-1;i>=0;i--){if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))continue;
+if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=MagicNumberRed&&OrderMagicNumber()!=MagicNumberBlue)continue;
+if(OrderCloseTime()!=0)continue;tot+=OrderLots();}return tot;}
+
+void PrintActiveOrders(){double pt=GetAdjustedPoint();int cnt=0;
+for(int i=OrdersTotal()-1;i>=0;i--){if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))continue;
+if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=MagicNumberRed&&OrderMagicNumber()!=MagicNumberBlue)continue;
+if(OrderCloseTime()!=0)continue;string tm=(OrderMagicNumber()==MagicNumberRed)?"RED":"BLUE";
+string tp=(OrderType()==OP_BUY)?"BUY":"SELL";double slp=0;
+if(OrderType()==OP_BUY)slp=(OrderOpenPrice()-OrderStopLoss())/pt;
+else if(OrderType()==OP_SELL)slp=(OrderStopLoss()-OrderOpenPrice())/pt;
+SmartPrint(tm+" #"+IntegerToString(OrderTicket())+" "+tp+" "+DoubleToString(OrderLots(),2)+
+" SL:"+DoubleToString(slp,1)+"p P/L:$"+DoubleToString(OrderProfit(),2),true);cnt++;}
+if(cnt==0)SmartPrint("No orders",true);}
+
+int CountOrders(int mg){int cnt=0;int tot=OrdersTotal();
+if(tot<0){SmartPrint("ERROR: OrdersTotal negative",true);return 0;}
+for(int i=tot-1;i>=0;i--){if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)){
+int err=GetLastError();if(err!=0&&err!=4051)SmartPrint("OrderSelect err:"+IntegerToString(err));continue;}
+if(OrderSymbol()!=Symbol())continue;if(OrderMagicNumber()!=mg)continue;
+if(OrderCloseTime()!=0)continue;cnt++;}return cnt;}
+
+void CloseAllOrders(){RefreshRates();int cls=0;int fail=0;int retry=0;int maxatt=3;int perm=0;
+for(int i=OrdersTotal()-1;i>=0;i--){if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))continue;
+if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=MagicNumberRed&&OrderMagicNumber()!=MagicNumberBlue)continue;
+if(OrderCloseTime()!=0)continue;int tk=OrderTicket();double lot=OrderLots();int ot=OrderType();
+bool ok=false;for(int att=0;att<maxatt&&!ok;att++){RefreshRates();
+double cp=(ot==OP_BUY)?Bid:Ask;
+if(ot==OP_BUY)ok=OrderClose(tk,lot,cp,MaxSlippage,clrNONE);
+else if(ot==OP_SELL)ok=OrderClose(tk,lot,cp,MaxSlippage,clrNONE);
+if(!ok&&att<maxatt-1)Sleep(100);}
+if(ok){cls++;SmartPrint("✓ Closed #"+IntegerToString(tk));}
+else{int err=GetLastError();fail++;if(err==4756)err=146;
+bool retr=(err==4||err==6||err==8||err==128||err==135||err==136||err==137||err==138||err==146||err==141);
+if(retr){AddPendingCloseRetry(tk);retry++;SmartPrint("Close retry #"+IntegerToString(tk));}
+else{perm++;SmartPrint("PERM FAIL #"+IntegerToString(tk)+" Err:"+IntegerToString(err),true);}}}
+if(cls>0||fail>0){string sum="Closed "+IntegerToString(cls);
+if(retry>0)sum+=" | Retry:"+IntegerToString(retry);
+if(perm>0)sum+=" | Perm:"+IntegerToString(perm);SmartPrint(sum,true);}}
+
+void ResetEA(){
+InitialBalance=AccountBalance();IsInitialized=false;RedTeamDirection="SELL";BlueTeamDirection="BUY";
+RedLastLot=0;BlueLastLot=0;AghanimActive=false;TotalLossFromInitial=0;
+BalanceAtAghanimActivation=0;LastLockedLoss=0;AghanimTriggeredRed=false;AghanimTriggeredBlue=false;
+TickCounter=0;ArrayResize(AdjustedTickets,0);AdjustedTicketCount=0;LastCleanupTime=GetTickCount();
+for(int i=0;i<retryCount;i++){pendingRetries[i].active=false;pendingRetries[i].attemptCount=0;}
+retryCount=0;SuccessfulOrders=0;FailedOrders=0;TotalOrderAttempts=0;MaxTotalLotReached=0;
+LockedTargetEquity=0;LastStatusPrintTime=GetTickCount();LastCleanupPrintTime=GetTickCount();
+LastBalanceCheckTime=GetTickCount();
+SmartPrint("========================================",true);
+SmartPrint("*** EA RESET ***",true);
+SmartPrint("New Balance: $"+DoubleToString(InitialBalance,2),true);
+SmartPrint("All locks reset",true);
+SmartPrint("========================================",true);}
+
+string ErrorDescription(int e){
+switch(e){case 0:return"No error";case 1:return"Success";case 2:return"Common error";
+case 4:return"Server busy";case 6:return"No connection";case 8:return"Too frequent";
+case 128:return"Timeout";case 129:return"Invalid price";case 130:return"Invalid stops";
+case 131:return"Invalid volume";case 132:return"Market closed";case 133:return"Trade disabled";
+case 134:return"Not enough money";case 135:return"Price changed";case 136:return"Off quotes";
+case 137:return"Broker busy";case 138:return"Requote";case 139:return"Order locked";
+case 141:return"Too many requests";case 145:return"Mod denied";case 146:return"Context busy";
+case 147:return"Expiration denied";case 148:return"Too many orders";case 4051:return"Invalid ticket";
+case 4756:return"Context busy";default:return"Unknown "+IntegerToString(e);}}
+
+// ===== PART 2 SELESAI =====
+// ===== PART 3: PANEL FUNCTIONS (FIXED - NO WARNINGS) =====
+// Copy code ini dan GANTI PART 3 yang lama
+
+void CreatePanel(){
+int y=PanelY;int lh=18;
+CreateObject(PanelPrefix+"BG",PanelX-5,y-5,260,340,PanelBG);
+CreateLabel(PanelPrefix+"Title",PanelX,y,PanelYellow,"⚡ TEAM TRADING EA PRO",10,true);y+=lh+8;
+CreateLabel(PanelPrefix+"Status",PanelX,y,PanelGreen,"● Status: ACTIVE",9,false);y+=lh;
+CreateLabel(PanelPrefix+"Balance",PanelX,y,PanelText,"Balance: $0.00",9,false);y+=lh;
+CreateLabel(PanelPrefix+"Equity",PanelX,y,PanelText,"Equity: $0.00",9,false);y+=lh;
+CreateLabel(PanelPrefix+"Profit",PanelX,y,PanelGreen,"Profit: +$0.00",9,false);y+=lh+5;
+CreateSeparator(PanelPrefix+"Sep1",PanelX,y,240);y+=10;
+CreateLabel(PanelPrefix+"Orders",PanelX,y,PanelText,"Active Orders: 0",9,false);y+=lh;
+CreateLabel(PanelPrefix+"TotalLot",PanelX,y,PanelText,"Total Lot: 0.00",9,false);y+=lh;
+CreateLabel(PanelPrefix+"MaxLot",PanelX,y,PanelText,"Max Lot: 0.00",9,false);y+=lh;
+CreateLabel(PanelPrefix+"Target",PanelX,y,PanelYellow,"🎯 Target: $0.00",9,false);y+=lh+5;
+CreateSeparator(PanelPrefix+"Sep2",PanelX,y,240);y+=10;
+CreateLabel(PanelPrefix+"RedTeam",PanelX,y,PanelRed,"🔴 RED: SELL | 0.00",9,false);y+=lh;
+CreateLabel(PanelPrefix+"BlueTeam",PanelX,y,PanelBlue,"🔵 BLUE: BUY | 0.00",9,false);y+=lh+5;
+CreateSeparator(PanelPrefix+"Sep3",PanelX,y,240);y+=10;
+CreateLabel(PanelPrefix+"AghanimTitle",PanelX,y,PanelPurple,"⚔️ AGHANIM'S SCEPTER",9,true);y+=lh;
+CreateLabel(PanelPrefix+"AghanimStatus",PanelX,y,C'150,150,160',"Status: Disabled",8,false);y+=lh;
+CreateLabel(PanelPrefix+"AghanimLoss",PanelX,y,C'150,150,160',"Locked Loss: $0.00",8,false);y+=lh+5;
+CreateSeparator(PanelPrefix+"Sep4",PanelX,y,240);y+=8;
+CreateLabel(PanelPrefix+"StatsTitle",PanelX,y,C'180,180,180',"Statistics",8,true);y+=lh;
+CreateLabel(PanelPrefix+"SuccessRate",PanelX,y,C'150,150,160',"Success Rate: 0%",8,false);
+ChartRedraw();}
+
+void UpdatePanel(){
+string st="● Status: ";color sc=PanelGreen;
+if(IsPaused){st+="PAUSED";sc=PanelRed;}
+else if(WaitingForOrdersToClose){st+="CLOSING...";sc=PanelYellow;}
+else{st+="ACTIVE";sc=PanelGreen;}
+UpdateLabel(PanelPrefix+"Status",st,sc);
+UpdateLabel(PanelPrefix+"Balance","Balance: $"+DoubleToString(AccountBalance(),2),PanelText);
+UpdateLabel(PanelPrefix+"Equity","Equity: $"+DoubleToString(AccountEquity(),2),PanelText);
+double pf=AccountEquity()-InitialBalance;color pfc=(pf>=0)?PanelGreen:PanelRed;
+string pfs=(pf>=0)?"+":"";
+UpdateLabel(PanelPrefix+"Profit","Profit: "+pfs+"$"+DoubleToString(pf,2),pfc);
+int tot=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+UpdateLabel(PanelPrefix+"Orders","Active Orders: "+IntegerToString(tot),PanelText);
+double tl=GetTotalLot();
+UpdateLabel(PanelPrefix+"TotalLot","Total Lot: "+DoubleToString(tl,2),PanelText);
+UpdateLabel(PanelPrefix+"MaxLot","Max Lot: "+DoubleToString(MaxTotalLotReached,2),PanelText);
+color tc=(AccountEquity()>=TargetEquity)?PanelGreen:PanelYellow;
+string tt="🎯 Target: $"+DoubleToString(TargetEquity,2);
+if(AccountEquity()>=TargetEquity)tt+=" ✓";
+UpdateLabel(PanelPrefix+"Target",tt,tc);
+UpdateLabel(PanelPrefix+"RedTeam","🔴 RED: "+RedTeamDirection+" | "+DoubleToString(RedLastLot,2),PanelRed);
+UpdateLabel(PanelPrefix+"BlueTeam","🔵 BLUE: "+BlueTeamDirection+" | "+DoubleToString(BlueLastLot,2),PanelBlue);
+if(AghanimActive){
+UpdateLabel(PanelPrefix+"AghanimStatus","Status: ✓ ACTIVE",PanelPurple);
+double rec=LastLockedLoss-(InitialBalance-AccountBalance());
+if(rec>0&&LastLockedLoss>0){double recp=(rec*100.0)/LastLockedLoss;
+UpdateLabel(PanelPrefix+"AghanimLoss","Loss: $"+DoubleToString(LastLockedLoss,2)+" | Rec: "+DoubleToString(recp,1)+"%",PanelYellow);}
+else{UpdateLabel(PanelPrefix+"AghanimLoss","Locked Loss: $"+DoubleToString(LastLockedLoss,2),PanelRed);}}
+else if(EnableAghanimScepter){
+UpdateLabel(PanelPrefix+"AghanimStatus","Status: Ready ("+DoubleToString(AghanimTriggerLot,2)+")",C'200,200,100');
+UpdateLabel(PanelPrefix+"AghanimLoss","Red: "+DoubleToString(RedLastLot,2)+" | Blue: "+DoubleToString(BlueLastLot,2),C'150,150,160');}
+else{
+UpdateLabel(PanelPrefix+"AghanimStatus","Status: Disabled",C'100,100,110');
+UpdateLabel(PanelPrefix+"AghanimLoss","Enable in settings",C'100,100,110');}
+if(TotalOrderAttempts>0){double sr=(SuccessfulOrders*100.0)/TotalOrderAttempts;
+color rc=(sr>=90)?PanelGreen:(sr>=70)?PanelYellow:PanelRed;
+UpdateLabel(PanelPrefix+"SuccessRate","Success: "+IntegerToString(SuccessfulOrders)+"/"+IntegerToString(TotalOrderAttempts)+" ("+DoubleToString(sr,1)+"%)",rc);}
+else{UpdateLabel(PanelPrefix+"SuccessRate","Success Rate: No orders",C'150,150,160');}
+ChartRedraw();}
+
+void CreateLabel(string n,int x,int y,color c,string t,int fs,bool b){
+ObjectCreate(0,n,OBJ_LABEL,0,0,0);
+ObjectSetInteger(0,n,OBJPROP_CORNER,PanelCorner);
+ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x);
+ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y);
+ObjectSetInteger(0,n,OBJPROP_COLOR,c);
+ObjectSetInteger(0,n,OBJPROP_FONTSIZE,fs);
+if(b)ObjectSetString(0,n,OBJPROP_FONT,"Arial Black");
+else ObjectSetString(0,n,OBJPROP_FONT,"Consolas");
+ObjectSetString(0,n,OBJPROP_TEXT,t);
+ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);}
+
+void CreateObject(string n,int x,int y,int w,int h,color bg){
+ObjectCreate(0,n,OBJ_RECTANGLE_LABEL,0,0,0);
+ObjectSetInteger(0,n,OBJPROP_CORNER,PanelCorner);
+ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x);
+ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y);
+ObjectSetInteger(0,n,OBJPROP_XSIZE,w);
+ObjectSetInteger(0,n,OBJPROP_YSIZE,h);
+ObjectSetInteger(0,n,OBJPROP_BGCOLOR,bg);
+ObjectSetInteger(0,n,OBJPROP_BORDER_TYPE,BORDER_FLAT);
+ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);}
+
+void CreateSeparator(string n,int x,int y,int w){
+ObjectCreate(0,n,OBJ_RECTANGLE_LABEL,0,0,0);
+ObjectSetInteger(0,n,OBJPROP_CORNER,PanelCorner);
+ObjectSetInteger(0,n,OBJPROP_XDISTANCE,x);
+ObjectSetInteger(0,n,OBJPROP_YDISTANCE,y);
+ObjectSetInteger(0,n,OBJPROP_XSIZE,w);
+ObjectSetInteger(0,n,OBJPROP_YSIZE,1);
+ObjectSetInteger(0,n,OBJPROP_BGCOLOR,C'60,60,70');
+ObjectSetInteger(0,n,OBJPROP_BORDER_TYPE,BORDER_FLAT);
+ObjectSetInteger(0,n,OBJPROP_SELECTABLE,false);}
+
+void UpdateLabel(string n,string t,color c){
+if(ObjectFind(0,n)>=0){
+ObjectSetString(0,n,OBJPROP_TEXT,t);
+ObjectSetInteger(0,n,OBJPROP_COLOR,c);}}
+
+void DeletePanel(){
+ObjectsDeleteAll(0,PanelPrefix);
+ChartRedraw();}
+
+// ===== SELESAI - 0 ERRORS, 0 WARNINGS! =====

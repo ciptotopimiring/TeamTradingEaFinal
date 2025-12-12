@@ -1,0 +1,797 @@
+//+------------------------------------------------------------------+
+//|                                     Team Trading EA Pro.mq4       |
+//+------------------------------------------------------------------+
+#property copyright "Team Trading EA Pro - v5.22 FINAL"
+#property version   "5.22"
+#property strict
+
+input double InitialLot=0.01;input double LotIncrement=0.01;input int StopLossPips=100;input double ReverseLot=0.40;
+input double ProfitPerLot=100.0;input int MagicNumberRed=1001;input int MagicNumberBlue=2001;
+input bool EnableAghanimScepter=false;input double AghanimTriggerLot=0.30;input bool EnableTradingHours=false;
+input int StartHour=0;input int StartMinute=0;input int PauseHour=23;input int PauseMinute=59;
+input int MaxRetries=5;input int RetryDelay=150;input int MaxSlippage=3;input bool EnableAutoTuning=false;
+input int LatencyThreshold=15;input bool EnableDebugMode=false;input int StatusUpdateInterval=300;
+input bool EnableSpreadFilter=true;input double MaxSpreadPips=3.0;
+
+double InitialBalance,TargetEquity,MaxTotalLotReached,LockedTargetEquity,RedLastLot,BlueLastLot;
+double TotalLossFromInitial,BalanceAtAghanimActivation,LastLockedLoss,LastMeasuredLatency;
+bool IsInitialized,ShowStatusUpdate,AghanimActive,AghanimTriggeredRed,AghanimTriggeredBlue;
+bool IsTrading=true,IsPaused,WaitingForOrdersToClose,PrintOrderDetails=true;
+string RedTeamDirection="SELL",BlueTeamDirection="BUY";
+uint LastTickCount,LastStatusPrintTime,LastCleanupPrintTime,LastCleanupTime,LastTuningTime;
+int TickCounter,AdjustedTickets[],AdjustedTicketCount,CurrentMaxRetries=5,CurrentRetryDelay=150;
+int SuccessfulOrders,FailedOrders,TotalOrderAttempts,retryCount;
+uint LastBalanceCheckTime=0; // FIX: Track balance changes
+
+struct RetryInfo{string action;int ticket;double targetSL,lots,price,sl,closePrice;uint lastAttemptTime;
+int attemptCount,magicNumber,orderType;bool active;string direction;};
+RetryInfo pendingRetries[100];
+
+int OnInit(){
+if(!ValidateInputs())return INIT_PARAMETERS_INCORRECT;
+InitialBalance=AccountBalance();IsInitialized=false;AghanimActive=false;TotalLossFromInitial=0;
+BalanceAtAghanimActivation=0;LastLockedLoss=0;AghanimTriggeredRed=false;AghanimTriggeredBlue=false;
+IsTrading=true;IsPaused=false;WaitingForOrdersToClose=false;LastTickCount=0;TickCounter=0;
+ArrayResize(AdjustedTickets,0);AdjustedTicketCount=0;LastCleanupTime=0;retryCount=0;
+CurrentMaxRetries=MaxRetries;CurrentRetryDelay=RetryDelay;LastMeasuredLatency=0;LastTuningTime=0;
+SuccessfulOrders=0;FailedOrders=0;TotalOrderAttempts=0;MaxTotalLotReached=0;LockedTargetEquity=0;
+LastStatusPrintTime=0;LastCleanupPrintTime=0;PrintOrderDetails=true;LastBalanceCheckTime=GetTickCount();
+Print("========================================");
+Print("EA Initialized - v5.22 FINAL");Print("Initial Balance: $",DoubleToString(InitialBalance,2));
+Print("Aghanim's Scepter: ",EnableAghanimScepter?"ENABLED":"DISABLED");
+if(EnableAghanimScepter)Print("Aghanim Trigger Lot: ",DoubleToString(AghanimTriggerLot,2));
+if(EnableTradingHours){Print("Trading Hours: ENABLED");
+Print("Start: ",IntegerToString(StartHour,2,'0'),":",IntegerToString(StartMinute,2,'0'));
+Print("Pause: ",IntegerToString(PauseHour,2,'0'),":",IntegerToString(PauseMinute,2,'0'));}
+Print("Retries: ",MaxRetries," | Delay: ",RetryDelay,"ms | Slippage: ",MaxSlippage);
+Print("Spread Filter: ",EnableSpreadFilter?"ON (Max "+DoubleToString(MaxSpreadPips,1)+" pips)":"OFF");
+Print("Debug Mode: ",EnableDebugMode?"ON":"OFF");
+if(!EnableDebugMode)Print("Status updates every ",StatusUpdateInterval," seconds");
+Print("========================================");return INIT_SUCCEEDED;}
+
+bool ValidateInputs(){
+bool isValid=true;
+if(MagicNumberRed==MagicNumberBlue){Print("ERROR: Magic numbers must be different!");isValid=false;}
+if(InitialLot<=0){Print("ERROR: InitialLot must be > 0");isValid=false;}
+if(LotIncrement<0){Print("ERROR: LotIncrement cannot be negative");isValid=false;}
+if(ReverseLot<InitialLot)Print("WARNING: ReverseLot < InitialLot!");
+if(StopLossPips<=0){Print("ERROR: StopLossPips must be > 0");isValid=false;}
+if(ProfitPerLot<=0){Print("ERROR: ProfitPerLot must be > 0");isValid=false;}
+if(EnableAghanimScepter&&AghanimTriggerLot<InitialLot)Print("WARNING: AghanimTriggerLot < InitialLot!");
+if(MaxRetries<1){Print("ERROR: MaxRetries must be >= 1");isValid=false;}
+if(MaxRetries>15)Print("WARNING: MaxRetries > 15 is excessive");
+if(RetryDelay<50)Print("WARNING: RetryDelay < 50ms may cause errors");
+if(EnableSpreadFilter&&MaxSpreadPips<=0){Print("ERROR: MaxSpreadPips must be > 0");isValid=false;}
+// FIX: Validate lot against broker limits
+double minLot=MarketInfo(Symbol(),MODE_MINLOT);
+if(InitialLot<minLot){Print("ERROR: InitialLot (",InitialLot,") < Broker MinLot (",minLot,")");isValid=false;}
+return isValid;}
+
+void OnDeinit(const int reason){
+Print("EA Stopped. Reason: ",reason);
+if(TotalOrderAttempts>0){double successRate=(SuccessfulOrders*100.0)/TotalOrderAttempts;
+Print("Success Rate: ",DoubleToString(successRate,2),"%");
+Print("Total: ",TotalOrderAttempts," | Success: ",SuccessfulOrders," | Failed: ",FailedOrders);}}
+
+void OnTick(){
+TickCounter++;LastTickCount=GetTickCount();RefreshRates();
+// FIX: Check for balance changes (deposits/withdrawals)
+CheckBalanceChanges();
+ProcessPendingRetries();CheckTradingHours();
+if(WaitingForOrdersToClose){int totalOrders=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(totalOrders==0){IsPaused=true;WaitingForOrdersToClose=false;IsTrading=false;
+Print("EA PAUSED - All orders closed");return;}
+else{CheckAghanimActivation();CalculateTargetEquity();
+if(TargetEquity>0&&AccountEquity()>=TargetEquity){Print("TARGET REACHED DURING PAUSE!");
+CloseAllOrders();int remainingOrders=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(remainingOrders==0){ResetEA();IsPaused=true;WaitingForOrdersToClose=false;IsTrading=false;}
+return;}return;}}
+if(IsPaused||!IsTrading)return;
+if(!IsInitialized){InitializeOrders();IsInitialized=true;return;}
+AutoAdjustNewOrdersSL();if(EnableAutoTuning)AutoTuneExecutionSettings();
+CheckAghanimActivation();CalculateTargetEquity();
+if(EnableDebugMode||ShowStatusUpdate||ShouldPrintStatus()){PrintStatus();ShowStatusUpdate=false;}
+int totalOrders=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(TargetEquity>0&&AccountEquity()>=TargetEquity&&totalOrders>0&&MaxTotalLotReached>0){
+PrintTargetReached();CloseAllOrders();
+// FIX: Double-check orders closed before reset
+Sleep(500);RefreshRates();
+int remainingOrders=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(remainingOrders==0){ResetEA();}
+else{Print("WARNING: ",remainingOrders," orders still open, waiting...");WaitingForOrdersToClose=true;}
+return;}
+MonitorTeam(MagicNumberRed,RedTeamDirection,RedLastLot,"RED");
+MonitorTeam(MagicNumberBlue,BlueTeamDirection,BlueLastLot,"BLUE");}
+
+// FIX BUG #11: Detect deposits/withdrawals
+void CheckBalanceChanges(){
+uint currentTime=GetTickCount();
+if(currentTime-LastBalanceCheckTime<30000)return; // Check every 30 seconds
+LastBalanceCheckTime=currentTime;
+double currentBalance=AccountBalance();
+int totalOrders=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(totalOrders==0){
+double balanceDiff=currentBalance-InitialBalance;
+if(MathAbs(balanceDiff)>1.0){ // If balance changed by more than $1
+Print("BALANCE CHANGE DETECTED: $",DoubleToString(balanceDiff,2));
+Print("Adjusting Initial Balance: $",DoubleToString(InitialBalance,2)," → $",DoubleToString(currentBalance,2));
+InitialBalance=currentBalance;
+if(AghanimActive){
+BalanceAtAghanimActivation=currentBalance;
+LastLockedLoss=0;
+Print("Aghanim mode adjusted to new balance");
+}
+}
+}
+}
+
+void ProcessPendingRetries(){
+uint currentTime=GetTickCount();int processedCount=0;
+for(int i=0;i<retryCount;i++){if(!pendingRetries[i].active)continue;
+// FIX BUG #23: Handle GetTickCount() overflow
+uint timeDiff=0;
+if(currentTime>=pendingRetries[i].lastAttemptTime)
+timeDiff=currentTime-pendingRetries[i].lastAttemptTime;
+else
+timeDiff=0xFFFFFFFF-pendingRetries[i].lastAttemptTime+currentTime; // Overflow handling
+if(timeDiff<(uint)CurrentRetryDelay)continue;
+bool success=false;
+if(pendingRetries[i].action=="MODIFY_SL"){
+// FIX BUG #3: Check order still exists and open
+if(OrderSelect(pendingRetries[i].ticket,SELECT_BY_TICKET)&&OrderSymbol()==Symbol()&&OrderCloseTime()==0)
+success=OrderModify(pendingRetries[i].ticket,OrderOpenPrice(),pendingRetries[i].targetSL,0,0,clrNONE);
+else success=true;} // Order already closed or doesn't exist
+else if(pendingRetries[i].action=="OPEN_ORDER"){
+// FIX BUG #20: Apply spread filter to retries
+if(EnableSpreadFilter){
+RefreshRates();
+double point=GetAdjustedPoint();
+double spread=(Ask-Bid)/point;
+if(spread>MaxSpreadPips){
+if(EnableDebugMode)Print("Retry blocked: Spread ",DoubleToString(spread,1)," > ",MaxSpreadPips);
+pendingRetries[i].lastAttemptTime=currentTime; // Retry later
+continue;
+}
+}
+RefreshRates();
+color clr=(pendingRetries[i].orderType==OP_BUY)?clrBlue:clrRed;uint startTime=GetTickCount();
+int ticket=OrderSend(Symbol(),pendingRetries[i].orderType,pendingRetries[i].lots,
+pendingRetries[i].price,MaxSlippage,pendingRetries[i].sl,0,"Team Trading",
+pendingRetries[i].magicNumber,0,clr);uint endTime=GetTickCount();
+double executionTime=(double)(endTime-startTime);
+if(ticket>0){success=true;SuccessfulOrders++;
+if(executionTime>0&&executionTime<10000){ // FIX BUG #15: Cap max latency
+if(LastMeasuredLatency>0)
+LastMeasuredLatency=MathMin(5000,(LastMeasuredLatency*0.7)+(executionTime*0.3));
+else LastMeasuredLatency=MathMin(5000,executionTime);}
+if(EnableDebugMode)Print("✓ Order opened (retry) ",pendingRetries[i].direction," #",ticket," Lot:",pendingRetries[i].lots);}}
+else if(pendingRetries[i].action=="CLOSE_ORDER"){
+if(OrderSelect(pendingRetries[i].ticket,SELECT_BY_TICKET)&&OrderSymbol()==Symbol()){
+if(OrderCloseTime()==0){RefreshRates();int orderType=OrderType();double lots=OrderLots();
+double closePrice=(orderType==OP_BUY)?Bid:Ask;
+success=OrderClose(pendingRetries[i].ticket,lots,closePrice,MaxSlippage,clrNONE);
+if(success&&EnableDebugMode)Print("✓ Order closed (retry) #",pendingRetries[i].ticket);}
+else success=true;}else success=true;}
+// FIX BUG #1: Always increment attempt count
+pendingRetries[i].attemptCount++;
+if(success||pendingRetries[i].attemptCount>=CurrentMaxRetries){
+pendingRetries[i].active=false;processedCount++;
+if(EnableDebugMode){if(success)Print("✓ Retry success: ",pendingRetries[i].action," #",pendingRetries[i].ticket);
+else{Print("✗ Retry failed after ",pendingRetries[i].attemptCount," attempts: ",pendingRetries[i].action);
+if(pendingRetries[i].action=="OPEN_ORDER")FailedOrders++;}}}
+else{pendingRetries[i].lastAttemptTime=currentTime;}}
+static uint lastCleanupTime=0;
+// FIX BUG #23: Handle overflow in cleanup timing
+uint cleanupDiff=0;
+if(currentTime>=lastCleanupTime)cleanupDiff=currentTime-lastCleanupTime;
+else cleanupDiff=0xFFFFFFFF-lastCleanupTime+currentTime;
+if(cleanupDiff>60000){CleanupRetryQueue();lastCleanupTime=currentTime;}}
+
+void CleanupRetryQueue(){
+// FIX BUG #17: Make cleanup atomic-like
+int activeCount=0;for(int i=0;i<retryCount;i++)if(pendingRetries[i].active)activeCount++;
+if(activeCount<retryCount/2&&retryCount>20){RetryInfo tempQueue[100];int newCount=0;
+for(int i=0;i<retryCount&&newCount<100;i++) // FIX: Prevent overflow
+if(pendingRetries[i].active){tempQueue[newCount]=pendingRetries[i];newCount++;}
+for(int i=0;i<newCount;i++)pendingRetries[i]=tempQueue[i];
+// FIX BUG #27: Properly reset all fields to prevent memory leak
+for(int i=newCount;i<retryCount;i++){
+pendingRetries[i].action="";
+pendingRetries[i].ticket=0;
+pendingRetries[i].targetSL=0;
+pendingRetries[i].lots=0;
+pendingRetries[i].price=0;
+pendingRetries[i].sl=0;
+pendingRetries[i].closePrice=0;
+pendingRetries[i].lastAttemptTime=0;
+pendingRetries[i].attemptCount=0;
+pendingRetries[i].magicNumber=0;
+pendingRetries[i].orderType=0;
+pendingRetries[i].active=false;
+pendingRetries[i].direction="";}
+int freedSlots=retryCount-newCount;retryCount=newCount;
+if(EnableDebugMode&&freedSlots>0)Print("Queue cleanup: Freed ",freedSlots," slots (",newCount," active)");}}
+
+void AddPendingRetry(string action,int ticket,double targetSL=0){
+// FIX BUG #6: Better array bounds checking
+if(retryCount>=100){Print("ERROR: Retry queue full (100)! Skipping retry.");return;}
+int freeSlot=-1;for(int i=0;i<retryCount;i++)if(!pendingRetries[i].active){freeSlot=i;break;}
+if(freeSlot>=0){pendingRetries[freeSlot].action=action;pendingRetries[freeSlot].ticket=ticket;
+pendingRetries[freeSlot].targetSL=targetSL;pendingRetries[freeSlot].lastAttemptTime=GetTickCount();
+pendingRetries[freeSlot].attemptCount=0; // FIX: Start at 0
+pendingRetries[freeSlot].active=true;return;}
+pendingRetries[retryCount].action=action;pendingRetries[retryCount].ticket=ticket;
+pendingRetries[retryCount].targetSL=targetSL;pendingRetries[retryCount].lastAttemptTime=GetTickCount();
+pendingRetries[retryCount].attemptCount=0;pendingRetries[retryCount].active=true;retryCount++;}
+
+void AddPendingOrderRetry(string direction,double lots,int magicNumber,double price,double sl,int orderType){
+if(retryCount>=100){Print("ERROR: Cannot add order retry - Queue full!");return;}
+int freeSlot=-1;for(int i=0;i<retryCount;i++)if(!pendingRetries[i].active){freeSlot=i;break;}
+if(freeSlot>=0){pendingRetries[freeSlot].action="OPEN_ORDER";
+pendingRetries[freeSlot].direction=direction;pendingRetries[freeSlot].lots=lots;
+pendingRetries[freeSlot].magicNumber=magicNumber;pendingRetries[freeSlot].price=price;
+pendingRetries[freeSlot].sl=sl;pendingRetries[freeSlot].orderType=orderType;
+pendingRetries[freeSlot].lastAttemptTime=GetTickCount();
+pendingRetries[freeSlot].attemptCount=0;pendingRetries[freeSlot].active=true;return;}
+pendingRetries[retryCount].action="OPEN_ORDER";
+pendingRetries[retryCount].direction=direction;pendingRetries[retryCount].lots=lots;
+pendingRetries[retryCount].magicNumber=magicNumber;pendingRetries[retryCount].price=price;
+pendingRetries[retryCount].sl=sl;pendingRetries[retryCount].orderType=orderType;
+pendingRetries[retryCount].lastAttemptTime=GetTickCount();
+pendingRetries[retryCount].attemptCount=0;pendingRetries[retryCount].active=true;retryCount++;}
+
+void AddPendingCloseRetry(int ticket){
+if(retryCount>=100){Print("ERROR: Cannot add close retry - Queue full!");return;}
+int freeSlot=-1;for(int i=0;i<retryCount;i++)if(!pendingRetries[i].active){freeSlot=i;break;}
+if(freeSlot>=0){pendingRetries[freeSlot].action="CLOSE_ORDER";pendingRetries[freeSlot].ticket=ticket;
+pendingRetries[freeSlot].lastAttemptTime=GetTickCount();
+pendingRetries[freeSlot].attemptCount=0;pendingRetries[freeSlot].active=true;return;}
+pendingRetries[retryCount].action="CLOSE_ORDER";pendingRetries[retryCount].ticket=ticket;
+pendingRetries[retryCount].lastAttemptTime=GetTickCount();
+pendingRetries[retryCount].attemptCount=0;pendingRetries[retryCount].active=true;retryCount++;}
+
+// FIX BUG #5: Better point calculation
+double GetAdjustedPoint(){
+double point=Point;
+if(Digits==5)point=Point*10; // 5-digit broker
+else if(Digits==3&&StringFind(Symbol(),"JPY")<0)point=Point*10; // 3-digit non-JPY (rare)
+// JPY pairs with 3 digits use Point as-is (0.01 = 1 pip)
+return point;}
+
+double DetectBrokerHealth(){
+if(LastMeasuredLatency>0&&LastMeasuredLatency<5000)return LastMeasuredLatency; // FIX: Cap max
+uint startTick=GetTickCount();datetime serverTime=TimeCurrent();RefreshRates();uint endTick=GetTickCount();
+double measuredLatency=(double)(endTick-startTick);
+if(measuredLatency<5)measuredLatency=50;
+if(measuredLatency>5000)measuredLatency=5000; // FIX: Cap extreme values
+return measuredLatency;}
+
+void AutoTuneExecutionSettings(){
+uint currentTime=GetTickCount();
+// FIX BUG #23: Handle overflow
+if(LastTuningTime>0){
+uint timeDiff=0;
+if(currentTime>=LastTuningTime)timeDiff=currentTime-LastTuningTime;
+else timeDiff=0xFFFFFFFF-LastTuningTime+currentTime;
+if(timeDiff<60000)return;}
+double currentLatency=DetectBrokerHealth();
+if(LastMeasuredLatency>0&&LastMeasuredLatency<5000){double latencyDiff=MathAbs(currentLatency-LastMeasuredLatency);
+if(latencyDiff<LatencyThreshold){LastTuningTime=currentTime;return;}
+if(EnableDebugMode)Print("AUTO-TUNING: Latency changed ",DoubleToString(latencyDiff,1),"ms");}
+LastMeasuredLatency=currentLatency;LastTuningTime=currentTime;ApplyAdaptiveSettings(currentLatency);}
+
+void ApplyAdaptiveSettings(double latency){
+int oldRetries=CurrentMaxRetries;int oldDelay=CurrentRetryDelay;
+if(latency<50){CurrentMaxRetries=3;CurrentRetryDelay=100;}
+else if(latency<100){CurrentMaxRetries=3;CurrentRetryDelay=120;}
+else if(latency<150){CurrentMaxRetries=5;CurrentRetryDelay=150;}
+else if(latency<200){CurrentMaxRetries=5;CurrentRetryDelay=170;}
+else if(latency<300){CurrentMaxRetries=7;CurrentRetryDelay=200;}
+else if(latency<500){CurrentMaxRetries=10;CurrentRetryDelay=250;}
+else{CurrentMaxRetries=12;CurrentRetryDelay=300;}
+CurrentMaxRetries=(int)MathMax(3,MathMin(15,CurrentMaxRetries));
+CurrentRetryDelay=(int)MathMax(50,MathMin(500,CurrentRetryDelay));
+if((oldRetries!=CurrentMaxRetries||oldDelay!=CurrentRetryDelay)&&EnableDebugMode)
+Print("Settings: Retries ",oldRetries,"→",CurrentMaxRetries," | Delay ",oldDelay,"→",CurrentRetryDelay,"ms");}
+
+bool IsTicketAdjusted(int ticket){
+for(int i=0;i<AdjustedTicketCount;i++)if(AdjustedTickets[i]==ticket)return true;return false;}
+
+void AddAdjustedTicket(int ticket){
+if(IsTicketAdjusted(ticket))return;
+if(AdjustedTicketCount>=ArraySize(AdjustedTickets))ArrayResize(AdjustedTickets,AdjustedTicketCount+50);
+AdjustedTickets[AdjustedTicketCount]=ticket;AdjustedTicketCount++;}
+
+void CleanupAdjustedTickets(){
+uint currentTime=GetTickCount();
+// FIX BUG #23: Handle overflow
+uint timeDiff=0;
+if(currentTime>=LastCleanupTime)timeDiff=currentTime-LastCleanupTime;
+else timeDiff=0xFFFFFFFF-LastCleanupTime+currentTime;
+if(timeDiff<300000)return; // 5 minutes
+LastCleanupTime=currentTime;
+int tempTickets[];int tempCount=0;ArrayResize(tempTickets,AdjustedTicketCount);
+for(int i=0;i<AdjustedTicketCount;i++)
+if(OrderSelect(AdjustedTickets[i],SELECT_BY_TICKET)&&OrderSymbol()==Symbol()) // FIX: Check symbol
+if(OrderCloseTime()==0){tempTickets[tempCount]=AdjustedTickets[i];tempCount++;}
+// FIX BUG #14: Shrink array to free memory
+if(tempCount<AdjustedTicketCount){
+if(tempCount>0){ArrayResize(AdjustedTickets,tempCount);
+for(int i=0;i<tempCount;i++)AdjustedTickets[i]=tempTickets[i];}
+else ArrayResize(AdjustedTickets,0); // Completely free if empty
+int removed=AdjustedTicketCount-tempCount;AdjustedTicketCount=tempCount;
+uint printDiff=0;
+if(currentTime>=LastCleanupPrintTime)printDiff=currentTime-LastCleanupPrintTime;
+else printDiff=0xFFFFFFFF-LastCleanupPrintTime+currentTime;
+if(EnableDebugMode&&removed>0&&printDiff>300000){
+Print("Adjusted tickets cleanup: Removed ",removed," closed orders (",tempCount," active)");
+LastCleanupPrintTime=currentTime;}}}
+
+void AutoAdjustNewOrdersSL(){
+double point=GetAdjustedPoint(); // FIX BUG #5: Use correct point calculation
+double slDistance=StopLossPips*point;CleanupAdjustedTickets();int adjustedCount=0;
+// FIX BUG #31: Store order info before loop to avoid race condition
+int totalOrders=OrdersTotal();
+int orderTickets[];int orderTypes[];double orderOpenPrices[];double orderStopLosses[];
+int orderMagics[];int validOrderCount=0;
+ArrayResize(orderTickets,totalOrders);
+ArrayResize(orderTypes,totalOrders);
+ArrayResize(orderOpenPrices,totalOrders);
+ArrayResize(orderStopLosses,totalOrders);
+ArrayResize(orderMagics,totalOrders);
+// First pass: collect order data
+for(int i=totalOrders-1;i>=0;i--){
+if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))continue;
+if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=MagicNumberRed&&OrderMagicNumber()!=MagicNumberBlue)continue;
+if(OrderCloseTime()!=0)continue;
+orderTickets[validOrderCount]=OrderTicket();
+orderTypes[validOrderCount]=OrderType();
+orderOpenPrices[validOrderCount]=OrderOpenPrice();
+orderStopLosses[validOrderCount]=OrderStopLoss();
+orderMagics[validOrderCount]=OrderMagicNumber();
+validOrderCount++;}
+// Second pass: process collected orders
+for(int idx=0;idx<validOrderCount;idx++){
+int ticket=orderTickets[idx];
+if(IsTicketAdjusted(ticket))continue;
+// Reselect to ensure order still exists
+if(!OrderSelect(ticket,SELECT_BY_TICKET)||OrderSymbol()!=Symbol()){
+if(EnableDebugMode)Print("Order #",ticket," no longer exists, skipping");
+AddAdjustedTicket(ticket);continue;}
+if(OrderCloseTime()!=0){AddAdjustedTicket(ticket);continue;}
+int orderType=orderTypes[idx];
+double openPrice=orderOpenPrices[idx];
+double currentSL=orderStopLosses[idx];
+double targetSL;double currentSlPips=0;
+if(orderType==OP_BUY){
+if(openPrice<=slDistance){
+if(EnableDebugMode)Print("WARNING: Cannot set SL for #",ticket," - Price too close to zero");
+AddAdjustedTicket(ticket);continue;}
+targetSL=NormalizeDouble(openPrice-slDistance,Digits);
+double minStopLevel=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+if((openPrice-targetSL)<minStopLevel)targetSL=NormalizeDouble(openPrice-minStopLevel,Digits);
+if(currentSL>0)currentSlPips=(openPrice-currentSL)/point;}
+else if(orderType==OP_SELL){
+targetSL=NormalizeDouble(openPrice+slDistance,Digits);
+double minStopLevel=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+if((targetSL-openPrice)<minStopLevel)targetSL=NormalizeDouble(openPrice+minStopLevel,Digits);
+if(currentSL>0)currentSlPips=(currentSL-openPrice)/point;}
+else{AddAdjustedTicket(ticket);continue;}
+if(targetSL<=0){
+if(EnableDebugMode)Print("ERROR: Invalid targetSL for #",ticket);
+AddAdjustedTicket(ticket);continue;}
+if(currentSL==0||MathAbs(currentSlPips-StopLossPips)>2){
+if(AdjustOrderSL(ticket,targetSL)){adjustedCount++;
+if(EnableDebugMode&&OrderSelect(ticket,SELECT_BY_TICKET)&&OrderSymbol()==Symbol()){
+double finalPips=0;
+if(OrderType()==OP_BUY)finalPips=(OrderOpenPrice()-OrderStopLoss())/point;
+else finalPips=(OrderStopLoss()-OrderOpenPrice())/point;
+Print("✓ SL Adjusted #",ticket," → ",DoubleToString(finalPips,1)," pips");}}}
+AddAdjustedTicket(ticket);}
+if(adjustedCount>0&&!EnableDebugMode)Print("Adjusted ",adjustedCount," order(s) SL");}
+
+bool AdjustOrderSL(int ticket,double targetSL){
+// FIX BUG #3: Reselect and verify order still exists
+if(!OrderSelect(ticket,SELECT_BY_TICKET)||OrderSymbol()!=Symbol()){
+if(EnableDebugMode)Print("ERROR: Cannot select #",ticket," or wrong symbol");return false;}
+if(OrderCloseTime()!=0){if(EnableDebugMode)Print("Order #",ticket," already closed");return true;}
+uint startTime=GetTickCount();
+bool result=OrderModify(ticket,OrderOpenPrice(),targetSL,0,0,clrNONE);
+uint endTime=GetTickCount();double executionTime=(double)(endTime-startTime);
+if(result&&executionTime>0&&executionTime<10000){ // FIX BUG #15: Cap latency
+if(LastMeasuredLatency>0)LastMeasuredLatency=MathMin(5000,(LastMeasuredLatency*0.7)+(executionTime*0.3));
+else LastMeasuredLatency=MathMin(5000,executionTime);}
+if(!result){int error=GetLastError();if(error==1)return true;
+if(error==130){if(EnableDebugMode)Print("⚠ Invalid SL #",ticket," (Error 130)");return false;}
+if(error==4756)error=146; // FIX BUG #13: Normalize trade context busy
+if(error==135||error==136||error==138||error==146){AddPendingRetry("MODIFY_SL",ticket,targetSL);return false;}
+if(EnableDebugMode)Print("⚠ SL failed #",ticket," Error:",error);return false;}
+return true;}
+
+void CheckTradingHours(){
+if(!EnableTradingHours){IsTrading=true;IsPaused=false;return;}
+datetime currentTime=TimeCurrent();int currentHour=TimeHour(currentTime);int currentMinute=TimeMinute(currentTime);
+int currentMinutes=currentHour*60+currentMinute;int startMinutes=StartHour*60+StartMinute;
+int pauseMinutes=PauseHour*60+PauseMinute;bool shouldTrade=false;
+if(startMinutes<pauseMinutes)shouldTrade=(currentMinutes>=startMinutes&&currentMinutes<pauseMinutes);
+else if(startMinutes>pauseMinutes)shouldTrade=(currentMinutes>=startMinutes||currentMinutes<pauseMinutes);
+else shouldTrade=true;
+if(!WaitingForOrdersToClose&&!IsPaused&&IsTrading&&!shouldTrade){
+Print("PAUSE TIME REACHED");CalculateTargetEquity();
+if(TargetEquity>0&&AccountEquity()>=TargetEquity){
+Print("Target reached at pause time, closing orders...");CloseAllOrders();
+Sleep(500);RefreshRates(); // FIX: Wait for close
+int remainingOrders=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(remainingOrders==0){ResetEA();IsPaused=true;IsTrading=false;WaitingForOrdersToClose=false;}
+else{WaitingForOrdersToClose=true;IsTrading=false;}}
+else{int totalOrders=CountOrders(MagicNumberRed)+CountOrders(MagicNumberBlue);
+if(totalOrders>0){Print("Waiting for ",totalOrders," order(s) to close...");
+WaitingForOrdersToClose=true;IsTrading=false;}
+else{IsPaused=true;IsTrading=false;Print("EA PAUSED - No orders");}}}
+if(IsPaused&&shouldTrade){IsPaused=false;IsTrading=true;WaitingForOrdersToClose=false;Print("EA RESUMED");}}
+
+void InitializeOrders(){
+bool redOpened=OpenOrder(RedTeamDirection,InitialLot,MagicNumberRed);
+bool blueOpened=OpenOrder(BlueTeamDirection,InitialLot,MagicNumberBlue);
+if(redOpened)RedLastLot=InitialLot;
+if(blueOpened)BlueLastLot=InitialLot;
+Sleep(100);RefreshRates(); // FIX: Refresh after opening
+double totalLot=GetTotalLot();
+if(totalLot>0){
+MaxTotalLotReached=totalLot;
+double targetProfit=totalLot*ProfitPerLot;
+LockedTargetEquity=InitialBalance+targetProfit;
+TargetEquity=LockedTargetEquity;
+Print("========================================");
+Print("Initial orders opened:");
+Print("Red Team: ",RedTeamDirection," | Lot: ",InitialLot);
+Print("Blue Team: ",BlueTeamDirection," | Lot: ",InitialLot);
+Print("Total Lot: ",DoubleToString(totalLot,2));
+Print("Initial Target: $",DoubleToString(TargetEquity,2));
+Print("Target Profit: $",DoubleToString(targetProfit,2));
+Print("========================================");}
+else{
+Print("WARNING: No orders opened successfully!");
+Print("Will retry on next tick...");}
+ShowStatusUpdate=true;}
+
+void CheckAghanimActivation(){
+if(!EnableAghanimScepter||AghanimActive)return;bool shouldActivate=false;
+if(!AghanimTriggeredRed&&RedLastLot>=AghanimTriggerLot){
+AghanimTriggeredRed=true;shouldActivate=true;
+if(EnableDebugMode)Print(">>> RED TEAM reached Aghanim: ",RedLastLot);}
+if(!AghanimTriggeredBlue&&BlueLastLot>=AghanimTriggerLot){
+AghanimTriggeredBlue=true;shouldActivate=true;
+if(EnableDebugMode)Print(">>> BLUE TEAM reached Aghanim: ",BlueLastLot);}
+if(shouldActivate){AghanimActive=true;BalanceAtAghanimActivation=AccountBalance();
+double initialLoss=InitialBalance-BalanceAtAghanimActivation;if(initialLoss<0)initialLoss=0;
+LastLockedLoss=initialLoss;TotalLossFromInitial=initialLoss;
+Print("========================================");Print("*** AGHANIM'S SCEPTER ACTIVATED! ***");
+Print("Initial Balance: $",DoubleToString(InitialBalance,2));
+Print("Balance at Activation: $",DoubleToString(BalanceAtAghanimActivation,2));
+Print("Total Loss: $",DoubleToString(TotalLossFromInitial,2));
+Print("Locked Loss: $",DoubleToString(LastLockedLoss,2));
+Print("Target Equity: $",DoubleToString(InitialBalance+LastLockedLoss,2));
+Print("Required Profit from now: $",DoubleToString(LastLockedLoss*2.0,2));
+Print("========================================");ShowStatusUpdate=true;}}
+
+void CalculateTargetEquity(){
+if(AghanimActive){
+double currentBalance=AccountBalance();
+double currentLoss=InitialBalance-currentBalance;
+if(currentLoss<0)currentLoss=0;
+// FIX BUG #30: Always track highest loss, even if balance recovered temporarily
+if(currentLoss>LastLockedLoss){
+LastLockedLoss=currentLoss;
+TotalLossFromInitial=currentLoss;
+Print(">>> AGHANIM: Loss increased to $",DoubleToString(currentLoss,2));
+Print(">>> Target updated to $",DoubleToString(InitialBalance+currentLoss,2));}
+// FIX BUG #30: Check if balance went below previous locked level again
+else if(currentBalance<(InitialBalance-LastLockedLoss)){
+// Balance dropped below previous lowest point
+double newLoss=InitialBalance-currentBalance;
+LastLockedLoss=newLoss;
+TotalLossFromInitial=newLoss;
+Print(">>> AGHANIM: Balance dropped below previous low!");
+Print(">>> New Loss: $",DoubleToString(newLoss,2));
+Print(">>> Target updated to $",DoubleToString(InitialBalance+newLoss,2));}
+TargetEquity=InitialBalance+LastLockedLoss;}
+else{double totalLot=GetTotalLot();
+// FIX BUG #22: Reset max lot if current lot decreased significantly
+if(totalLot<MaxTotalLotReached*0.5&&MaxTotalLotReached>InitialLot*2){
+if(EnableDebugMode)Print(">>> Max Lot decreased significantly, adjusting target");
+MaxTotalLotReached=MathMax(totalLot,InitialLot*2);}
+if(totalLot>MaxTotalLotReached){MaxTotalLotReached=totalLot;
+if(EnableDebugMode)Print(">>> Max Total Lot updated: ",DoubleToString(MaxTotalLotReached,2));}
+double targetProfit=MaxTotalLotReached*ProfitPerLot;
+double calculatedTarget=InitialBalance+targetProfit;
+double minimumTarget=InitialBalance+(InitialLot*2*ProfitPerLot);
+calculatedTarget=MathMax(calculatedTarget,minimumTarget);
+if(calculatedTarget>LockedTargetEquity){LockedTargetEquity=calculatedTarget;
+if(EnableDebugMode)Print(">>> Target locked at: $",DoubleToString(LockedTargetEquity,2));}
+TargetEquity=LockedTargetEquity;}}
+
+bool ShouldPrintStatus(){
+uint currentTime=GetTickCount();
+if(LastStatusPrintTime==0){LastStatusPrintTime=currentTime;return false;}
+// FIX BUG #23: Handle overflow
+uint elapsedTime=0;
+if(currentTime>=LastStatusPrintTime)elapsedTime=currentTime-LastStatusPrintTime;
+else elapsedTime=0xFFFFFFFF-LastStatusPrintTime+currentTime;
+uint elapsedSeconds=elapsedTime/1000;
+if(elapsedSeconds>=(uint)StatusUpdateInterval){LastStatusPrintTime=currentTime;return true;}
+return false;}
+
+void PrintTargetReached(){
+Print("========================================");Print("TARGET EQUITY REACHED!");
+Print("Initial Balance: $",DoubleToString(InitialBalance,2));
+Print("Current Equity: $",DoubleToString(AccountEquity(),2));
+Print("Target Equity: $",DoubleToString(TargetEquity,2));
+Print("Profit: +$",DoubleToString(AccountEquity()-InitialBalance,2));
+if(AghanimActive){Print("--- AGHANIM'S SCEPTER RESULT ---");
+Print("Max Loss Locked: $",DoubleToString(LastLockedLoss,2));
+Print("Lowest Balance: $",DoubleToString(InitialBalance-LastLockedLoss,2));
+Print("Total Recovery: $",DoubleToString(AccountEquity()-(InitialBalance-LastLockedLoss),2));
+Print("Profit from lowest: $",DoubleToString(AccountEquity()-InitialBalance+LastLockedLoss,2));
+// FIX BUG #2: Prevent division by zero
+if(InitialBalance>0){
+double roi=((AccountEquity()-InitialBalance)*100.0)/InitialBalance;
+Print("ROI: ",DoubleToString(roi,2),"%");}}
+Print("========================================");}
+
+void PrintStatus(){
+Print("========================================");Print("--- STATUS UPDATE ---");
+if(EnableTradingHours)Print("Status: ",IsTrading?"ACTIVE":"PAUSED");
+Print("Initial: $",DoubleToString(InitialBalance,2));
+Print("Balance: $",DoubleToString(AccountBalance(),2));
+Print("Equity: $",DoubleToString(AccountEquity(),2));
+if(AghanimActive){Print("--- AGHANIM MODE: ACTIVE ---");
+Print("Balance at Activation: $",DoubleToString(BalanceAtAghanimActivation,2));
+Print("Locked Loss (Max): $",DoubleToString(LastLockedLoss,2));
+double currentLoss=MathMax(0,InitialBalance-AccountBalance());
+Print("Current Loss: $",DoubleToString(currentLoss,2));
+if(currentLoss<LastLockedLoss){double recovery=LastLockedLoss-currentLoss;
+// FIX BUG #2: Prevent division by zero
+if(LastLockedLoss>0.01){
+Print("Recovered: $",DoubleToString(recovery,2)," (",
+DoubleToString((recovery*100.0)/LastLockedLoss,1),"%)");}
+else Print("Recovered: $",DoubleToString(recovery,2));}
+Print("Target Equity: $",DoubleToString(TargetEquity,2));
+double neededProfit=TargetEquity-AccountEquity();
+Print("Still Need: $",DoubleToString(neededProfit,2));
+double progressPct=0;
+// FIX BUG #2: Prevent division by zero
+if(LastLockedLoss>0.01){double totalNeeded=LastLockedLoss*2.0;
+if(totalNeeded>0.01){double achieved=totalNeeded-neededProfit;progressPct=(achieved*100.0)/totalNeeded;}}
+Print("Progress: ",DoubleToString(progressPct,1),"%");}
+else{double totalLot=GetTotalLot();
+Print("Total Lot: ",DoubleToString(totalLot,2));
+Print("Max Lot Reached: ",DoubleToString(MaxTotalLotReached,2));
+Print("Target Profit: $",DoubleToString(MaxTotalLotReached*ProfitPerLot,2));
+Print("Target Equity: $",DoubleToString(TargetEquity,2)," (Locked)");
+if(EnableAghanimScepter)Print("Aghanim: WAITING | Red:",RedLastLot," Blue:",BlueLastLot);}
+Print("--- Active Orders ---");PrintActiveOrders();Print("========================================");}
+
+void MonitorTeam(int magicNumber,string &direction,double &lastLot,string teamName){
+// FIX BUG #26: Recheck order count to prevent race condition
+int totalOrders=CountOrders(magicNumber);
+if(totalOrders==0){
+// Check if we're in valid trading conditions
+if(!IsTrading||IsPaused){
+if(EnableDebugMode)Print(teamName," skipped: EA not trading");
+return;}
+// Check spread filter
+if(EnableSpreadFilter){
+RefreshRates();
+double point=GetAdjustedPoint();
+double spread=(Ask-Bid)/point;
+if(spread>MaxSpreadPips){
+if(EnableDebugMode)Print(teamName," skipped: Spread too high");
+return;}}
+double newLot=CalculateNextLot(lastLot);
+if(lastLot>=ReverseLot){direction=(direction=="BUY")?"SELL":"BUY";
+Print(teamName," REVERSE! Lot:",lastLot," → Dir:",direction," NewLot:",newLot);}
+else if(EnableDebugMode)Print(teamName," continues: ",direction," Lot:",newLot);
+// FIX BUG #26: Double-check no order opened between checks
+RefreshRates();
+int recheckOrders=CountOrders(magicNumber);
+if(recheckOrders==0){
+if(OpenOrder(direction,newLot,magicNumber)){lastLot=newLot;ShowStatusUpdate=true;}}
+else if(EnableDebugMode)Print(teamName," order already exists, skipping open");}}
+
+double CalculateNextLot(double currentLot){
+double nextLot=currentLot+LotIncrement;
+double minLot=MarketInfo(Symbol(),MODE_MINLOT);
+double maxLot=MarketInfo(Symbol(),MODE_MAXLOT);
+double lotStep=MarketInfo(Symbol(),MODE_LOTSTEP);
+// FIX BUG #12: Ensure minimum lot is respected
+if(nextLot<minLot)nextLot=minLot;
+nextLot=MathMax(minLot,MathMin(maxLot,nextLot));
+nextLot=NormalizeDouble(nextLot/lotStep,0)*lotStep;
+// FIX: Ensure result is never below minLot
+if(nextLot<minLot)nextLot=minLot;
+return nextLot;}
+
+bool OpenOrder(string direction,double lots,int magicNumber){
+double point=GetAdjustedPoint(); // FIX BUG #5
+// FIX BUG #29: Check spread filter RIGHT before OrderSend
+RefreshRates();
+if(EnableSpreadFilter){double spread=(Ask-Bid)/point;
+if(spread>MaxSpreadPips){
+Print("Order blocked: Spread ",DoubleToString(spread,1)," > ",MaxSpreadPips," pips");
+return false;}}
+double slDistance=StopLossPips*point;double price,sl;int orderType;color clr;
+if(direction=="BUY"){price=Ask;
+// FIX BUG #4: Ensure SL won't be negative
+if(price<=slDistance){Print("Order blocked: Price too low for SL");return false;}
+sl=NormalizeDouble(price-slDistance,Digits);
+// FIX BUG #24: Check minimum stop level
+double minStopLevel=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+if((price-sl)<minStopLevel)sl=NormalizeDouble(price-minStopLevel,Digits);
+orderType=OP_BUY;clr=clrBlue;}
+else{price=Bid;sl=NormalizeDouble(price+slDistance,Digits);
+double minStopLevel=MarketInfo(Symbol(),MODE_STOPLEVEL)*Point;
+if((sl-price)<minStopLevel)sl=NormalizeDouble(price+minStopLevel,Digits);
+orderType=OP_SELL;clr=clrRed;}
+// Validate SL
+if(sl<=0){Print("Order blocked: Invalid SL calculated");return false;}
+double minLot=MarketInfo(Symbol(),MODE_MINLOT);
+double maxLot=MarketInfo(Symbol(),MODE_MAXLOT);
+if(lots<minLot||lots>maxLot){Print("Order blocked: Invalid lot size ",lots);return false;}
+double requiredMargin=MarketInfo(Symbol(),MODE_MARGINREQUIRED)*lots;
+double freeMargin=AccountFreeMargin();
+if(freeMargin<requiredMargin){
+Print("Order blocked: Insufficient margin. Required: $",DoubleToString(requiredMargin,2),
+" Available: $",DoubleToString(freeMargin,2));return false;}
+int ticket=-1;TotalOrderAttempts++;uint startTime=GetTickCount();
+ticket=OrderSend(Symbol(),orderType,lots,price,MaxSlippage,sl,0,"Team Trading",magicNumber,0,clr);
+uint endTime=GetTickCount();double executionTime=(double)(endTime-startTime);
+if(ticket>0&&executionTime>0&&executionTime<10000){ // FIX BUG #15
+if(LastMeasuredLatency>0)
+LastMeasuredLatency=MathMin(5000,(LastMeasuredLatency*0.7)+(executionTime*0.3));
+else LastMeasuredLatency=MathMin(5000,executionTime);}
+if(ticket>0){SuccessfulOrders++;
+// FIX BUG #21: Verify order selection and symbol
+if(OrderSelect(ticket,SELECT_BY_TICKET)&&OrderSymbol()==Symbol()){double actualSlPips=0;
+if(direction=="BUY")actualSlPips=(OrderOpenPrice()-OrderStopLoss())/point;
+else actualSlPips=(OrderStopLoss()-OrderOpenPrice())/point;
+Print("✓ Order ",direction," #",ticket," Lot:",lots," SL:",DoubleToString(actualSlPips,1)," pips");
+if(MathAbs(actualSlPips-StopLossPips)>5)
+Print("WARNING: SL deviation! Target:",StopLossPips," Actual:",DoubleToString(actualSlPips,1));}
+return true;}
+else{int error=GetLastError();
+Print("✗ OrderSend FAILED: ",direction," Lot:",lots," Error:",error," - ",ErrorDescription(error));
+Print("   Ask:",Ask," Bid:",Bid," Price:",price," SL:",sl);
+Print("   Spread:",(Ask-Bid)/point," pips | FreeMargin:$",AccountFreeMargin());
+if(error==129||error==130||error==131||error==134){FailedOrders++;
+Print("CRITICAL ERROR: Cannot open order - ",ErrorDescription(error));return false;}
+if(error==4756)error=146; // FIX BUG #13: Normalize error code
+if(error==135||error==136||error==138||error==146||error==4||error==8){
+Print("Retriable error - Adding to retry queue");
+AddPendingOrderRetry(direction,lots,magicNumber,price,sl,orderType);return false;}
+FailedOrders++;return false;}}
+
+double GetTotalLot(){
+double total=0;
+for(int i=OrdersTotal()-1;i>=0;i--){
+if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))continue;
+if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=MagicNumberRed&&OrderMagicNumber()!=MagicNumberBlue)continue;
+if(OrderCloseTime()!=0)continue; // FIX: Skip closed orders
+total+=OrderLots();}return total;}
+
+void PrintActiveOrders(){
+double point=GetAdjustedPoint(); // FIX BUG #5
+int orderCount=0;
+for(int i=OrdersTotal()-1;i>=0;i--){
+if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))continue;
+if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=MagicNumberRed&&OrderMagicNumber()!=MagicNumberBlue)continue;
+if(OrderCloseTime()!=0)continue; // FIX: Skip closed orders
+string team=(OrderMagicNumber()==MagicNumberRed)?"RED":"BLUE";
+string type=(OrderType()==OP_BUY)?"BUY":"SELL";double slPips=0;
+if(OrderType()==OP_BUY)slPips=(OrderOpenPrice()-OrderStopLoss())/point;
+else if(OrderType()==OP_SELL)slPips=(OrderStopLoss()-OrderOpenPrice())/point;
+Print(team," #",OrderTicket()," ",type," Lot:",DoubleToString(OrderLots(),2),
+" SL:",DoubleToString(slPips,1),"p P/L:$",DoubleToString(OrderProfit(),2));orderCount++;}
+if(orderCount==0)Print("No active orders");}
+
+int CountOrders(int magicNumber){
+int count=0;
+// FIX BUG #25: Better error handling
+int totalOrders=OrdersTotal();
+if(totalOrders<0){
+Print("ERROR: OrdersTotal() returned negative value");
+return 0;
+}
+for(int i=totalOrders-1;i>=0;i--){
+if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)){
+int error=GetLastError();
+if(error!=0&&error!=4051&&EnableDebugMode){ // 4051 = invalid ticket (order just closed)
+Print("WARNING: OrderSelect failed at index ",i," Error:",error);
+}
+continue;
+}
+if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=magicNumber)continue;
+if(OrderCloseTime()!=0)continue; // FIX: Count only open orders
+count++;}
+return count;
+}
+
+void CloseAllOrders(){
+RefreshRates();int closedCount=0;int failedCount=0;int retriableFailures=0;
+int maxAttempts=3; // FIX: Limit close attempts per order
+// FIX BUG #28: Track permanently failed orders to prevent infinite loop
+int permanentFailures=0;
+for(int i=OrdersTotal()-1;i>=0;i--){
+if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))continue;
+if(OrderSymbol()!=Symbol())continue;
+if(OrderMagicNumber()!=MagicNumberRed&&OrderMagicNumber()!=MagicNumberBlue)continue;
+if(OrderCloseTime()!=0)continue; // FIX: Skip already closed
+int ticket=OrderTicket();double orderLots=OrderLots();int orderType=OrderType();
+bool result=false;
+for(int attempt=0;attempt<maxAttempts&&!result;attempt++){
+RefreshRates(); // FIX BUG #8: Refresh before each attempt
+double closePrice=(orderType==OP_BUY)?Bid:Ask;
+if(orderType==OP_BUY)result=OrderClose(ticket,orderLots,closePrice,MaxSlippage,clrNONE);
+else if(orderType==OP_SELL)result=OrderClose(ticket,orderLots,closePrice,MaxSlippage,clrNONE);
+if(!result&&attempt<maxAttempts-1)Sleep(100); // Wait before retry
+}
+if(result){closedCount++;if(EnableDebugMode)Print("✓ Closed #",ticket);}
+else{int error=GetLastError();failedCount++;
+// FIX BUG #13: Handle error 4756
+if(error==4756)error=146;
+// FIX BUG #28: Identify non-retriable errors to prevent infinite loop
+bool isRetriable=(error==4||error==6||error==8||error==128||error==135||
+error==136||error==137||error==138||error==146||error==141);
+if(isRetriable){
+AddPendingCloseRetry(ticket);retriableFailures++;
+if(EnableDebugMode)Print("Close failed #",ticket," Error:",error," - Added to retry queue");}
+else{
+permanentFailures++;
+Print("PERMANENT CLOSE FAILURE #",ticket," Error:",error," - ",ErrorDescription(error));
+Print("Order will be skipped in future close attempts");}}}
+if(closedCount>0||failedCount>0){string summary="Closed "+IntegerToString(closedCount)+" order(s)";
+if(retriableFailures>0)summary+=" | Queued for retry: "+IntegerToString(retriableFailures);
+if(permanentFailures>0)summary+=" | Permanent failures: "+IntegerToString(permanentFailures);
+Print(summary);}}
+
+void ResetEA(){
+InitialBalance=AccountBalance();IsInitialized=false;RedTeamDirection="SELL";BlueTeamDirection="BUY";
+RedLastLot=0;BlueLastLot=0;
+// FIX BUG #16: Complete Aghanim reset
+AghanimActive=false;TotalLossFromInitial=0;
+BalanceAtAghanimActivation=0;LastLockedLoss=0;AghanimTriggeredRed=false;AghanimTriggeredBlue=false;
+TickCounter=0;
+// FIX BUG #14: Properly free memory
+ArrayResize(AdjustedTickets,0);AdjustedTicketCount=0;
+LastCleanupTime=GetTickCount();
+// FIX: Clear retry queue on reset
+for(int i=0;i<retryCount;i++){
+pendingRetries[i].active=false;
+pendingRetries[i].attemptCount=0;
+}
+retryCount=0;
+SuccessfulOrders=0;FailedOrders=0;TotalOrderAttempts=0;MaxTotalLotReached=0;LockedTargetEquity=0;
+LastStatusPrintTime=GetTickCount();LastCleanupPrintTime=GetTickCount();
+LastBalanceCheckTime=GetTickCount(); // FIX: Reset balance check timer
+Print("========================================");Print("EA RESET - New Cycle");
+Print("New Initial Balance: $",DoubleToString(InitialBalance,2));
+Print("All targets and locks reset");
+Print("Retry queue cleared");
+Print("========================================");}
+
+string ErrorDescription(int error){
+switch(error){case 0:return"No error";case 1:return"No error (trade operation successful)";
+case 2:return"Common error";case 4:return"Trade server busy";case 6:return"No connection";
+case 8:return"Too frequent requests";case 128:return"Trade timeout";case 129:return"Invalid price";
+case 130:return"Invalid stops";case 131:return"Invalid volume";case 132:return"Market closed";
+case 133:return"Trade disabled";case 134:return"Not enough money";case 135:return"Price changed";
+case 136:return"Off quotes";case 137:return"Broker busy";case 138:return"Requote";
+case 139:return"Order locked";case 141:return"Too many requests";case 145:return"Modification denied";
+case 146:return"Trade context busy";case 147:return"Expiration denied";case 148:return"Too many orders";
+case 4051:return"Invalid ticket";case 4756:return"Trade context busy (ERR_TRADE_CONTEXT_BUSY)"; // FIX BUG #13
+default:return"Unknown error "+IntegerToString(error);}}
+//+------------------------------------------------------------------+
